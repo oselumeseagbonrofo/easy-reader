@@ -14,17 +14,23 @@ import com.ebookreader.app.data.local.BookDao
 import com.ebookreader.app.data.local.BookEntity
 import com.ebookreader.app.data.local.BookmarkDao
 import com.ebookreader.app.data.local.BookmarkEntity
+import com.ebookreader.app.data.local.HighlightDao
+import com.ebookreader.app.data.local.HighlightEntity
 import com.ebookreader.app.data.parser.epub.EpubParser
+import com.ebookreader.app.data.parser.epub.EpubRandomAccessArchive
 import com.ebookreader.app.domain.model.Book
 import com.ebookreader.app.domain.model.BookFormat
 import com.ebookreader.app.domain.model.Bookmark
+import com.ebookreader.app.domain.model.HighlightColor
 import com.ebookreader.app.domain.model.ReadingProgressCalculator
+import com.ebookreader.app.domain.model.TextHighlight
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.security.MessageDigest
@@ -32,7 +38,8 @@ import java.security.MessageDigest
 class LibraryRepository(
     private val context: Context,
     private val bookDao: BookDao,
-    private val bookmarkDao: BookmarkDao
+    private val bookmarkDao: BookmarkDao,
+    private val highlightDao: HighlightDao
 ) {
 
     fun observeBooks(): Flow<List<Book>> = bookDao.observeAllBooks().map { entities ->
@@ -163,6 +170,11 @@ class LibraryRepository(
             list.map { it.toDomain() }
         }
 
+    fun observeHighlights(bookId: String): Flow<List<TextHighlight>> =
+        highlightDao.observeHighlightsForBook(bookId).map { list ->
+            list.map { it.toDomain() }
+        }
+
     suspend fun toggleBookmark(
         bookId: String,
         pageIndex: Int,
@@ -173,7 +185,7 @@ class LibraryRepository(
         snippet: String
     ): Boolean = withContext(Dispatchers.IO) {
         val existing = bookmarkDao.getBookmarksForBook(bookId).firstOrNull { bm ->
-            bm.pageIndex == pageIndex
+            bm.pageIndex == pageIndex && bm.epubEndCharOffset <= bm.epubCharOffset
         }
         if (existing != null) {
             bookmarkDao.deleteBookmarkById(existing.id)
@@ -186,6 +198,7 @@ class LibraryRepository(
                     pageIndex = pageIndex,
                     epubChapterIndex = epubChapterIndex,
                     epubCharOffset = epubCharOffset,
+                    epubEndCharOffset = epubCharOffset,
                     progress = progress,
                     chapterTitle = chapterTitle,
                     snippet = snippet.ifBlank { "Page ${pageIndex + 1}" }
@@ -195,8 +208,95 @@ class LibraryRepository(
         }
     }
 
+    suspend fun toggleSelectionBookmark(
+        bookId: String,
+        pageIndex: Int,
+        totalPages: Int,
+        chapterIndex: Int,
+        startCharOffset: Int,
+        endCharOffset: Int,
+        chapterTitle: String,
+        selectedText: String
+    ): Boolean = withContext(Dispatchers.IO) {
+        val safeEnd = maxOf(startCharOffset + 1, endCharOffset)
+        val existing = bookmarkDao.getBookmarksForBook(bookId).firstOrNull { bm ->
+            bm.epubChapterIndex == chapterIndex &&
+                bm.epubEndCharOffset > bm.epubCharOffset &&
+                bm.epubCharOffset == startCharOffset &&
+                bm.epubEndCharOffset == safeEnd
+        }
+        if (existing != null) {
+            bookmarkDao.deleteBookmarkById(existing.id)
+            false
+        } else {
+            val progress = ReadingProgressCalculator.computeProgress(pageIndex, totalPages)
+            bookmarkDao.insertBookmark(
+                BookmarkEntity(
+                    bookId = bookId,
+                    pageIndex = pageIndex,
+                    epubChapterIndex = chapterIndex,
+                    epubCharOffset = startCharOffset,
+                    epubEndCharOffset = safeEnd,
+                    progress = progress,
+                    chapterTitle = chapterTitle,
+                    snippet = selectedText.trim().take(600)
+                )
+            )
+            true
+        }
+    }
+
     suspend fun deleteBookmark(bookmarkId: Long) = withContext(Dispatchers.IO) {
         bookmarkDao.deleteBookmarkById(bookmarkId)
+    }
+
+    suspend fun saveHighlight(
+        bookId: String,
+        pageIndex: Int,
+        chapterIndex: Int,
+        startCharOffset: Int,
+        endCharOffset: Int,
+        chapterTitle: String,
+        selectedText: String,
+        color: HighlightColor
+    ) = withContext(Dispatchers.IO) {
+        if (endCharOffset <= startCharOffset) return@withContext
+        highlightDao.deleteOverlappingHighlights(
+            bookId = bookId,
+            chapterIndex = chapterIndex,
+            startOffset = startCharOffset,
+            endOffset = endCharOffset
+        )
+        highlightDao.insertHighlight(
+            HighlightEntity(
+                bookId = bookId,
+                pageIndex = pageIndex,
+                chapterIndex = chapterIndex,
+                startCharOffset = startCharOffset,
+                endCharOffset = endCharOffset,
+                chapterTitle = chapterTitle,
+                selectedText = selectedText.trim().take(600),
+                colorName = color.name
+            )
+        )
+    }
+
+    suspend fun clearHighlightsInRange(
+        bookId: String,
+        chapterIndex: Int,
+        startCharOffset: Int,
+        endCharOffset: Int
+    ) = withContext(Dispatchers.IO) {
+        highlightDao.deleteOverlappingHighlights(
+            bookId = bookId,
+            chapterIndex = chapterIndex,
+            startOffset = startCharOffset,
+            endOffset = endCharOffset
+        )
+    }
+
+    suspend fun deleteHighlight(highlightId: Long) = withContext(Dispatchers.IO) {
+        highlightDao.deleteHighlightById(highlightId)
     }
 
     fun isUriAccessible(uriString: String): Boolean {
@@ -359,7 +459,14 @@ class LibraryRepository(
         uri: Uri,
         fallbackTitle: String
     ): BookEntity {
-        val summary = EpubParser.extractMetadataAndCover(
+        val summary = runCatching {
+            context.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                FileInputStream(pfd.fileDescriptor).use { fis ->
+                    val archive = EpubRandomAccessArchive.openOrNull(fis.channel, closeChannelOnClose = false)
+                    archive?.let { EpubParser.extractMetadataAndCover(it, fallbackTitle) }
+                }
+            }
+        }.getOrNull() ?: EpubParser.extractMetadataAndCover(
             inputStreamProvider = {
                 context.contentResolver.openInputStream(uri)
                     ?: throw FileNotFoundException("Cannot read EPUB stream: $uri")

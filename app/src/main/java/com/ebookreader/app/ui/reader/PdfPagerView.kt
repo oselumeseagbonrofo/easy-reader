@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -29,6 +30,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.ColorFilter
@@ -44,7 +46,9 @@ import com.ebookreader.app.data.parser.pdf.PdfDocumentController
 import com.ebookreader.app.domain.model.ReaderSettings
 import com.ebookreader.app.domain.model.SearchMatch
 import com.ebookreader.app.ui.theme.ReaderPalette
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 private val NIGHT_INVERT_MATRIX = ColorMatrix(
@@ -54,6 +58,13 @@ private val NIGHT_INVERT_MATRIX = ColorMatrix(
         0f, 0f, -0.88f, 0f, 238f,
         0f, 0f, 0f, 1f, 0f
     )
+)
+
+private data class RenderedZoomTile(
+    val bitmap: Bitmap,
+    val scale: Float,
+    val offsetX: Float,
+    val offsetY: Float
 )
 
 @Composable
@@ -147,12 +158,25 @@ private fun PdfSinglePageSurface(
     var scale by remember(pageIndex) { mutableFloatStateOf(1f) }
     var offsetX by remember(pageIndex) { mutableFloatStateOf(0f) }
     var offsetY by remember(pageIndex) { mutableFloatStateOf(0f) }
+    var zoomTile by remember(pageIndex) { mutableStateOf<RenderedZoomTile?>(null) }
+
+    fun clearZoomTile() {
+        zoomTile?.bitmap?.let { bmp ->
+            if (!bmp.isRecycled) bmp.recycle()
+        }
+        zoomTile = null
+    }
+
+    DisposableEffect(pageIndex) {
+        onDispose { clearZoomTile() }
+    }
 
     LaunchedEffect(isActivePage) {
         if (!isActivePage && scale != 1f) {
             scale = 1f
             offsetX = 0f
             offsetY = 0f
+            clearZoomTile()
         }
     }
 
@@ -161,19 +185,68 @@ private fun PdfSinglePageSurface(
         modifier = Modifier
             .fillMaxSize()
             .padding(horizontal = 6.dp, vertical = 8.dp)
+            .clipToBounds()
     ) {
         val viewportWidthPx = with(density) { maxWidth.roundToPx() }.coerceAtLeast(360)
+        val viewportHeightPx = with(density) { maxHeight.roundToPx() }.coerceAtLeast(480)
         var pageBitmap by remember(pageIndex) { mutableStateOf<Bitmap?>(null) }
 
-        val highRes = scale > 1.45f
-        LaunchedEffect(controller, pageIndex, viewportWidthPx, highRes) {
+        LaunchedEffect(controller, pageIndex, viewportWidthPx) {
             val rendered = controller.renderPage(
                 pageIndex = pageIndex,
                 targetWidthPx = viewportWidthPx,
-                highResMultiplier = if (highRes) 2.25f else 1.45f
+                highResMultiplier = 1.25f
             )
             if (rendered != null) {
                 pageBitmap = rendered
+            }
+        }
+
+        // Viewport Tile Zoom: only rasterize the visible screen rectangle when zoomed in (>1.25x)
+        val baseBmp = pageBitmap
+        LaunchedEffect(controller, pageIndex, isActivePage, baseBmp, scale, offsetX, offsetY, viewportWidthPx, viewportHeightPx) {
+            if (!isActivePage || baseBmp == null || scale <= 1.25f) {
+                clearZoomTile()
+                return@LaunchedEffect
+            }
+            delay(110)
+
+            val bmpW = baseBmp.width.toFloat().coerceAtLeast(1f)
+            val bmpH = baseBmp.height.toFloat().coerceAtLeast(1f)
+            val fitScale = minOf(viewportWidthPx / bmpW, viewportHeightPx / bmpH)
+            val fitW = bmpW * fitScale
+            val fitH = bmpH * fitScale
+            val fitLeft = (viewportWidthPx - fitW) / 2f
+            val fitTop = (viewportHeightPx - fitH) / 2f
+
+            val targetScale = scale
+            val targetOx = offsetX
+            val targetOy = offsetY
+
+            val renderedTile = controller.renderViewportTile(
+                pageIndex = pageIndex,
+                viewportWidthPx = viewportWidthPx,
+                viewportHeightPx = viewportHeightPx,
+                fitLeft = fitLeft,
+                fitTop = fitTop,
+                fitWidth = fitW,
+                fitHeight = fitH,
+                zoomScale = targetScale,
+                panOffsetX = targetOx,
+                panOffsetY = targetOy
+            )
+
+            if (renderedTile != null) {
+                val previous = zoomTile
+                zoomTile = RenderedZoomTile(
+                    bitmap = renderedTile,
+                    scale = targetScale,
+                    offsetX = targetOx,
+                    offsetY = targetOy
+                )
+                if (previous != null && previous.bitmap !== renderedTile && !previous.bitmap.isRecycled) {
+                    previous.bitmap.recycle()
+                }
             }
         }
 
@@ -188,9 +261,10 @@ private fun PdfSinglePageSurface(
                                 scale = 1f
                                 offsetX = 0f
                                 offsetY = 0f
+                                clearZoomTile()
                                 onZoomStateChanged(false)
                             } else {
-                                scale = 2.2f
+                                scale = 2.4f
                                 onZoomStateChanged(true)
                             }
                         },
@@ -219,7 +293,7 @@ private fun PdfSinglePageSurface(
                                 val zoomChange = event.calculateZoom()
                                 val panChange = event.calculatePan()
 
-                                val newScale = (scale * zoomChange).coerceIn(1f, 4f)
+                                val newScale = (scale * zoomChange).coerceIn(1f, 5f)
                                 if (newScale > 1.02f) {
                                     val maxX = (size.width * (newScale - 1f)) / 2f
                                     val maxY = (size.height * (newScale - 1f)) / 2f
@@ -232,6 +306,7 @@ private fun PdfSinglePageSurface(
                                     scale = 1f
                                     offsetX = 0f
                                     offsetY = 0f
+                                    clearZoomTile()
                                     onZoomStateChanged(false)
                                 }
                             }
@@ -247,6 +322,7 @@ private fun PdfSinglePageSurface(
                     if (invertColors) ColorFilter.colorMatrix(NIGHT_INVERT_MATRIX) else null
                 }
 
+                // Layer 1: Instant 1x backdrop + search highlights inside scaled graphicsLayer
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
@@ -272,34 +348,52 @@ private fun PdfSinglePageSurface(
                         colorFilter = colorFilter
                     )
 
-                    pageMatches.forEach { match ->
-                        val isFocused = activeMatch != null && activeMatch.index == match.index
-                        val highlightColor = if (isFocused) {
-                            palette.activeSearchHighlight
-                        } else {
-                            palette.searchHighlight
-                        }
+                    drawPdfSearchHighlights(
+                        pageMatches = pageMatches,
+                        activeMatch = activeMatch,
+                        palette = palette,
+                        left = left,
+                        top = top,
+                        drawW = drawW,
+                        drawH = drawH
+                    )
+                }
 
-                        if (match.pdfRects.isNotEmpty()) {
-                            match.pdfRects.forEach { norm ->
-                                drawRect(
-                                    color = highlightColor,
-                                    topLeft = Offset(
-                                        x = left + norm.left * drawW,
-                                        y = top + norm.top * drawH
-                                    ),
-                                    size = Size(
-                                        width = ((norm.right - norm.left) * drawW).coerceAtLeast(6f),
-                                        height = ((norm.bottom - norm.top) * drawH).coerceAtLeast(10f)
-                                    )
-                                )
-                            }
-                        } else if (isFocused) {
-                            // Subtle border frame when text matched without character box coordinates
-                            drawRect(
-                                color = highlightColor.copy(alpha = 0.22f),
-                                topLeft = Offset(left, top),
-                                size = Size(drawW, 10f)
+                // Layer 2: High-DPI Viewport Tile overlay (screen-sized constant memory!)
+                val activeTile = zoomTile
+                if (activeTile != null &&
+                    !activeTile.bitmap.isRecycled &&
+                    abs(activeTile.scale - scale) < 0.015f &&
+                    abs(activeTile.offsetX - offsetX) < 2f &&
+                    abs(activeTile.offsetY - offsetY) < 2f
+                ) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        drawImage(
+                            image = activeTile.bitmap.asImageBitmap(),
+                            dstOffset = IntOffset.Zero,
+                            dstSize = IntSize(size.width.roundToInt(), size.height.roundToInt()),
+                            colorFilter = colorFilter
+                        )
+
+                        if (pageMatches.isNotEmpty()) {
+                            val bmpW = bmp.width.toFloat().coerceAtLeast(1f)
+                            val bmpH = bmp.height.toFloat().coerceAtLeast(1f)
+                            val fitScale = minOf(size.width / bmpW, size.height / bmpH)
+                            val fitW = bmpW * fitScale
+                            val fitH = bmpH * fitScale
+                            val fitLeft = (size.width - fitW) / 2f
+                            val fitTop = (size.height - fitH) / 2f
+                            val px = size.width / 2f
+                            val py = size.height / 2f
+
+                            drawPdfSearchHighlights(
+                                pageMatches = pageMatches,
+                                activeMatch = activeMatch,
+                                palette = palette,
+                                left = px + (fitLeft - px) * scale + offsetX,
+                                top = py + (fitTop - py) * scale + offsetY,
+                                drawW = fitW * scale,
+                                drawH = fitH * scale
                             )
                         }
                     }
@@ -316,6 +410,47 @@ private fun PdfSinglePageSurface(
                     .align(Alignment.TopEnd)
                     .padding(end = 10.dp)
                     .size(24.dp)
+            )
+        }
+    }
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawPdfSearchHighlights(
+    pageMatches: List<SearchMatch>,
+    activeMatch: SearchMatch?,
+    palette: ReaderPalette,
+    left: Float,
+    top: Float,
+    drawW: Float,
+    drawH: Float
+) {
+    pageMatches.forEach { match ->
+        val isFocused = activeMatch != null && activeMatch.index == match.index
+        val highlightColor = if (isFocused) {
+            palette.activeSearchHighlight
+        } else {
+            palette.searchHighlight
+        }
+
+        if (match.pdfRects.isNotEmpty()) {
+            match.pdfRects.forEach { norm ->
+                drawRect(
+                    color = highlightColor,
+                    topLeft = Offset(
+                        x = left + norm.left * drawW,
+                        y = top + norm.top * drawH
+                    ),
+                    size = Size(
+                        width = ((norm.right - norm.left) * drawW).coerceAtLeast(6f),
+                        height = ((norm.bottom - norm.top) * drawH).coerceAtLeast(10f)
+                    )
+                )
+            }
+        } else if (isFocused) {
+            drawRect(
+                color = highlightColor.copy(alpha = 0.22f),
+                topLeft = Offset(left, top),
+                size = Size(drawW, 10f)
             )
         }
     }

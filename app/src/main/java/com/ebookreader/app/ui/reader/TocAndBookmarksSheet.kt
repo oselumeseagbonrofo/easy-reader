@@ -1,5 +1,6 @@
 package com.ebookreader.app.ui.reader
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmark
@@ -37,11 +39,14 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.ebookreader.app.domain.model.Bookmark
+import com.ebookreader.app.domain.model.TextHighlight
 import com.ebookreader.app.domain.model.TocEntry
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -50,14 +55,17 @@ fun TocAndBookmarksSheet(
     initialTab: Int = 0,
     tocEntries: List<TocEntry>,
     bookmarks: List<Bookmark>,
+    highlights: List<TextHighlight>,
     currentPage: Int,
     onSelectTocEntry: (TocEntry) -> Unit,
     onSelectBookmark: (Bookmark) -> Unit,
     onDeleteBookmark: (Long) -> Unit,
+    onSelectHighlight: (TextHighlight) -> Unit,
+    onDeleteHighlight: (Long) -> Unit,
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var selectedTab by remember { mutableIntStateOf(initialTab) }
+    var selectedTab by remember { mutableIntStateOf(initialTab.coerceIn(0, 2)) }
 
     val activeTocIndex = remember(tocEntries, currentPage) {
         tocEntries.indexOfLast { it.pageIndex <= currentPage }
@@ -76,12 +84,17 @@ fun TocAndBookmarksSheet(
                 Tab(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
-                    text = { Text("Contents (${tocEntries.size})") }
+                    text = { Text("Contents (${tocEntries.size})", maxLines = 1, overflow = TextOverflow.Ellipsis) }
                 )
                 Tab(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
-                    text = { Text("Bookmarks (${bookmarks.size})") }
+                    text = { Text("Bookmarks (${bookmarks.size})", maxLines = 1, overflow = TextOverflow.Ellipsis) }
+                )
+                Tab(
+                    selected = selectedTab == 2,
+                    onClick = { selectedTab = 2 },
+                    text = { Text("Highlights (${highlights.size})", maxLines = 1, overflow = TextOverflow.Ellipsis) }
                 )
             }
 
@@ -149,7 +162,7 @@ fun TocAndBookmarksSheet(
                 1 -> {
                     if (bookmarks.isEmpty()) {
                         EmptySheetMessage(
-                            "No bookmarks saved yet.\nTap the bookmark icon in the top reader bar to save any page."
+                            "No bookmarks saved yet.\nTap the top bookmark icon for a page, or long-press EPUB text to bookmark a sentence or paragraph."
                         )
                     } else {
                         LazyColumn(
@@ -183,6 +196,7 @@ fun TocAndBookmarksSheet(
                                         Spacer(Modifier.width(12.dp))
                                         Column(modifier = Modifier.weight(1f)) {
                                             Row(
+                                                verticalAlignment = Alignment.CenterVertically,
                                                 horizontalArrangement = Arrangement.SpaceBetween,
                                                 modifier = Modifier.fillMaxWidth()
                                             ) {
@@ -195,7 +209,11 @@ fun TocAndBookmarksSheet(
                                                 )
                                                 Spacer(Modifier.width(8.dp))
                                                 Text(
-                                                    text = "p. ${bm.pageIndex + 1} · ${bm.progressPercent}%",
+                                                    text = if (bm.isTextSelection) {
+                                                        "Passage · p. ${bm.pageIndex + 1}"
+                                                    } else {
+                                                        "Page ${bm.pageIndex + 1} · ${bm.progressPercent}%"
+                                                    },
                                                     style = MaterialTheme.typography.labelMedium,
                                                     fontWeight = FontWeight.SemiBold,
                                                     color = MaterialTheme.colorScheme.primary
@@ -207,7 +225,7 @@ fun TocAndBookmarksSheet(
                                                 style = MaterialTheme.typography.bodyMedium,
                                                 fontStyle = FontStyle.Italic,
                                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                maxLines = 2,
+                                                maxLines = if (bm.isTextSelection) 4 else 2,
                                                 overflow = TextOverflow.Ellipsis
                                             )
                                         }
@@ -218,6 +236,86 @@ fun TocAndBookmarksSheet(
                                             Icon(
                                                 imageVector = Icons.Default.DeleteOutline,
                                                 contentDescription = "Delete bookmark",
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                2 -> {
+                    if (highlights.isEmpty()) {
+                        EmptySheetMessage(
+                            "No highlights yet.\nLong-press any sentence or paragraph in an EPUB to highlight it."
+                        )
+                    } else {
+                        LazyColumn(
+                            contentPadding = PaddingValues(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            items(highlights, key = { it.id }) { hl ->
+                                Surface(
+                                    shape = RoundedCornerShape(14.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            onSelectHighlight(hl)
+                                            onDismiss()
+                                        }
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.Top,
+                                        modifier = Modifier.padding(14.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .padding(top = 5.dp)
+                                                .size(14.dp)
+                                                .clip(CircleShape)
+                                                .background(Color(hl.color.argbHex or 0xFF000000L))
+                                        )
+                                        Spacer(Modifier.width(12.dp))
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            Row(
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                modifier = Modifier.fillMaxWidth()
+                                            ) {
+                                                Text(
+                                                    text = hl.chapterTitle,
+                                                    style = MaterialTheme.typography.titleMedium,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                Spacer(Modifier.width(8.dp))
+                                                Text(
+                                                    text = "p. ${hl.pageIndex + 1}",
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = MaterialTheme.colorScheme.primary
+                                                )
+                                            }
+                                            Spacer(Modifier.height(4.dp))
+                                            Text(
+                                                text = "“${hl.selectedText}”",
+                                                style = MaterialTheme.typography.bodyMedium,
+                                                color = MaterialTheme.colorScheme.onSurface,
+                                                maxLines = 4,
+                                                overflow = TextOverflow.Ellipsis
+                                            )
+                                        }
+                                        IconButton(
+                                            onClick = { onDeleteHighlight(hl.id) },
+                                            modifier = Modifier.size(32.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Default.DeleteOutline,
+                                                contentDescription = "Delete highlight",
                                                 modifier = Modifier.size(18.dp)
                                             )
                                         }

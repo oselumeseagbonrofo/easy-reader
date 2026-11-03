@@ -29,7 +29,8 @@ class AppContainer(context: android.content.Context) {
         LibraryRepository(
             context = context,
             bookDao = database.bookDao(),
-            bookmarkDao = database.bookmarkDao()
+            bookmarkDao = database.bookmarkDao(),
+            highlightDao = database.highlightDao()
         )
     }
 }

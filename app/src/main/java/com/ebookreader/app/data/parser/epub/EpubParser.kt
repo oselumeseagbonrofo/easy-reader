@@ -196,6 +196,135 @@ object EpubParser {
     }
 
     /**
+     * O(1) random-access metadata + cover extractor: reads only container.xml, OPF, and cover image
+     * without decompressing any chapter HTML or unrelated media entries.
+     */
+    fun extractMetadataAndCover(
+        archive: EpubRandomAccessArchive,
+        fallbackTitle: String
+    ): EpubMetadataSummary {
+        val opfPath = findOpfPathInArchive(archive) ?: return EpubMetadataSummary(
+            title = fallbackTitle,
+            author = "Unknown Author",
+            estimatedChapters = 1,
+            coverImageBytes = null
+        )
+        val opfBytes = archive.readEntry(opfPath, maxBytes = 4 * 1024 * 1024) ?: return EpubMetadataSummary(
+            title = fallbackTitle,
+            author = "Unknown Author",
+            estimatedChapters = 1,
+            coverImageBytes = null
+        )
+
+        val opfDoc = Jsoup.parse(String(opfBytes, StandardCharsets.UTF_8), "", Parser.xmlParser())
+        val parsedOpf = parseOpfDocument(opfDoc, opfPath, fallbackTitle)
+        val coverPath = parsedOpf.coverZipPath ?: archive.entryPaths.firstOrNull { path ->
+            val lower = path.lowercase()
+            ("cover" in lower) && (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png") || lower.endsWith(".webp"))
+        }
+
+        val coverBytes = coverPath?.let { archive.readEntry(it, maxBytes = 12 * 1024 * 1024) }
+
+        return EpubMetadataSummary(
+            title = parsedOpf.title,
+            author = parsedOpf.author,
+            estimatedChapters = parsedOpf.spinePaths.size.coerceAtLeast(1),
+            coverImageBytes = coverBytes
+        )
+    }
+
+    /**
+     * O(1) random-access EPUB parser using [EpubRandomAccessArchive].
+     */
+    fun parseBook(
+        archive: EpubRandomAccessArchive,
+        fallbackTitle: String = "Untitled Book",
+        includeCoverBytes: Boolean = false
+    ): EpubBook {
+        val opfPath = findOpfPathInArchive(archive)
+            ?: throw IllegalArgumentException("Invalid EPUB: missing OPF package document")
+        val opfBytes = archive.readEntry(opfPath, maxBytes = 8 * 1024 * 1024)
+            ?: throw IllegalArgumentException("Invalid EPUB: unreadable OPF at $opfPath")
+
+        val opfDoc = Jsoup.parse(String(opfBytes, StandardCharsets.UTF_8), "", Parser.xmlParser())
+        val parsedOpf = parseOpfDocument(opfDoc, opfPath, fallbackTitle)
+
+        val imageEntries = archive.entryPaths.filterTo(mutableSetOf()) { path ->
+            path.substringAfterLast('.', "").lowercase() in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp")
+        }
+
+        val rawToc = buildList {
+            if (parsedOpf.navZipPath != null) {
+                archive.readEntry(parsedOpf.navZipPath, maxBytes = 4 * 1024 * 1024)?.let { navBytes ->
+                    addAll(parseEpub3Nav(String(navBytes, StandardCharsets.UTF_8), parsedOpf.navZipPath))
+                }
+            }
+            if (isEmpty() && parsedOpf.ncxZipPath != null) {
+                archive.readEntry(parsedOpf.ncxZipPath, maxBytes = 4 * 1024 * 1024)?.let { ncxBytes ->
+                    addAll(parseEpub2Ncx(String(ncxBytes, StandardCharsets.UTF_8), parsedOpf.ncxZipPath))
+                }
+            }
+        }
+
+        val tocTitleByPath = rawToc.associate { it.zipPath to it.title }
+
+        val chapters = mutableListOf<EpubChapter>()
+        parsedOpf.spinePaths.forEach { spinePath ->
+            val rawBytes = archive.readEntry(spinePath, maxBytes = 8 * 1024 * 1024) ?: return@forEach
+            val html = String(rawBytes, StandardCharsets.UTF_8)
+            val chapterIndex = chapters.size
+            val chapter = parseChapterHtml(
+                index = chapterIndex,
+                zipPath = spinePath,
+                html = html,
+                fallbackTitle = tocTitleByPath[spinePath] ?: "Section ${chapterIndex + 1}",
+                availableImages = imageEntries
+            )
+            if (chapter.blocks.isNotEmpty()) {
+                chapters += chapter
+            }
+        }
+
+        val finalToc = rawToc.ifEmpty {
+            chapters.map { ch ->
+                EpubRawTocItem(
+                    title = ch.title,
+                    zipPath = ch.zipPath,
+                    fragmentId = null,
+                    depth = 0
+                )
+            }
+        }
+
+        val coverBytes = if (includeCoverBytes && parsedOpf.coverZipPath != null) {
+            archive.readEntry(parsedOpf.coverZipPath, maxBytes = 12 * 1024 * 1024)
+        } else {
+            null
+        }
+
+        return EpubBook(
+            title = parsedOpf.title,
+            author = parsedOpf.author,
+            chapters = chapters,
+            rawToc = finalToc,
+            coverImageBytes = coverBytes
+        )
+    }
+
+    private fun findOpfPathInArchive(archive: EpubRandomAccessArchive): String? {
+        archive.readEntry("META-INF/container.xml", maxBytes = 512 * 1024)?.let { containerBytes ->
+            val doc = Jsoup.parse(String(containerBytes, StandardCharsets.UTF_8), "", Parser.xmlParser())
+            val rootFile = doc.select("rootfile").firstOrNull()
+            val fullPath = rootFile?.attr("full-path")?.trim().orEmpty()
+            if (fullPath.isNotEmpty()) {
+                val normalized = normalizeZipPath(fullPath)
+                if (archive.hasEntry(normalized)) return normalized
+            }
+        }
+        return archive.entryPaths.firstOrNull { it.endsWith(".opf", ignoreCase = true) }
+    }
+
+    /**
      * Streams a single entry (e.g. an illustration image) on-demand from the external EPUB URI.
      */
     fun readSingleZipEntry(

@@ -52,7 +52,7 @@ interface BookDao {
 
 @Dao
 interface BookmarkDao {
-    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId ORDER BY pageIndex ASC, createdAt DESC")
+    @Query("SELECT * FROM bookmarks WHERE bookId = :bookId ORDER BY epubChapterIndex ASC, epubCharOffset ASC, pageIndex ASC, createdAt DESC")
     fun observeBookmarksForBook(bookId: String): Flow<List<BookmarkEntity>>
 
     @Query("SELECT * FROM bookmarks WHERE bookId = :bookId")
@@ -63,7 +63,33 @@ interface BookmarkDao {
 
     @Query("DELETE FROM bookmarks WHERE id = :bookmarkId")
     suspend fun deleteBookmarkById(bookmarkId: Long)
+}
 
-    @Query("DELETE FROM bookmarks WHERE bookId = :bookId AND pageIndex = :pageIndex")
-    suspend fun deleteBookmarkAtPage(bookId: String, pageIndex: Int)
+@Dao
+interface HighlightDao {
+    @Query("SELECT * FROM highlights WHERE bookId = :bookId ORDER BY chapterIndex ASC, startCharOffset ASC")
+    fun observeHighlightsForBook(bookId: String): Flow<List<HighlightEntity>>
+
+    @Query("SELECT * FROM highlights WHERE bookId = :bookId AND chapterIndex = :chapterIndex")
+    suspend fun getHighlightsForChapter(bookId: String, chapterIndex: Int): List<HighlightEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertHighlight(highlight: HighlightEntity): Long
+
+    @Query("DELETE FROM highlights WHERE id = :highlightId")
+    suspend fun deleteHighlightById(highlightId: Long)
+
+    @Query("""
+        DELETE FROM highlights
+        WHERE bookId = :bookId
+          AND chapterIndex = :chapterIndex
+          AND startCharOffset < :endOffset
+          AND endCharOffset > :startOffset
+    """)
+    suspend fun deleteOverlappingHighlights(
+        bookId: String,
+        chapterIndex: Int,
+        startOffset: Int,
+        endOffset: Int
+    )
 }

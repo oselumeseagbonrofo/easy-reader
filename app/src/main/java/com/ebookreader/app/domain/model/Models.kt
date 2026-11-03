@@ -54,15 +54,38 @@ data class Bookmark(
     val pageIndex: Int,
     val epubChapterIndex: Int,
     val epubCharOffset: Int,
+    val epubEndCharOffset: Int = epubCharOffset,
     val progress: Float,
     val chapterTitle: String,
     val snippet: String,
-    val note: String = "",
     val createdAt: Long = System.currentTimeMillis()
 ) {
+    val isTextSelection: Boolean
+        get() = epubEndCharOffset > epubCharOffset
+
     val progressPercent: Int
         get() = (progress.coerceIn(0f, 1f) * 100f).roundToInt()
 }
+
+enum class HighlightColor(val label: String, val argbHex: Long) {
+    YELLOW("Yellow", 0x66FACC15),
+    GREEN("Green", 0x664ADE80),
+    BLUE("Blue", 0x6638BDF8),
+    PINK("Pink", 0x66FB7185)
+}
+
+data class TextHighlight(
+    val id: Long = 0L,
+    val bookId: String,
+    val pageIndex: Int,
+    val chapterIndex: Int,
+    val startCharOffset: Int,
+    val endCharOffset: Int,
+    val chapterTitle: String,
+    val selectedText: String,
+    val color: HighlightColor = HighlightColor.YELLOW,
+    val createdAt: Long = System.currentTimeMillis()
+)
 
 data class TocEntry(
     val title: String,

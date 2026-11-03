@@ -94,9 +94,9 @@ fun ReaderScreen(
         }
     }
 
-    // Observe user page swipes and update ViewModel progress
-    LaunchedEffect(pagerState, uiState.totalPages, uiState.isPaginating) {
-        if (uiState.totalPages <= 0 || uiState.isPaginating) return@LaunchedEffect
+    // Observe user page swipes and update ViewModel progress without restarting on background chapter merge
+    LaunchedEffect(pagerState, uiState.isPaginating) {
+        if (uiState.isPaginating) return@LaunchedEffect
         snapshotFlow { pagerState.settledPage }
             .distinctUntilChanged()
             .collect { settled ->
@@ -104,7 +104,7 @@ fun ReaderScreen(
             }
     }
 
-    // Handle programmatic scroll commands (scrubber, TOC, bookmarks, search matches, initial restore)
+    // Handle programmatic scroll commands (scrubber, TOC, bookmarks, search matches, lazy chapter merge)
     LaunchedEffect(viewModel, pagerState) {
         viewModel.effects.collect { effect ->
             when (effect) {
@@ -118,6 +118,7 @@ fun ReaderScreen(
                             pagerState.scrollToPage(target)
                         }
                     }
+                    viewModel.onScrollEffectApplied(target)
                 }
                 is ReaderEffect.ShowSnackbar -> {
                     snackbarHostState.showSnackbar(effect.message)
@@ -126,8 +127,8 @@ fun ReaderScreen(
         }
     }
 
-    val bookmarkedPages = remember(uiState.bookmarks) {
-        uiState.bookmarks.map { it.pageIndex }.toSet()
+    val pdfBookmarkedPages = remember(uiState.bookmarks) {
+        uiState.bookmarks.filter { !it.isTextSelection }.map { it.pageIndex }.toSet()
     }
 
     Box(
@@ -218,14 +219,19 @@ fun ReaderScreen(
                                 }
                             } else {
                                 EpubPagerView(
+                                    epubBook = uiState.epubBook!!,
                                     pages = paginated.pages,
                                     pagerState = pagerState,
                                     settings = uiState.settings,
                                     palette = palette,
-                                    bookmarkedPages = bookmarkedPages,
+                                    bookmarks = uiState.bookmarks,
+                                    highlights = uiState.highlights,
                                     searchMatches = uiState.searchMatches,
                                     activeMatchIndex = uiState.activeMatchIndex,
                                     loadImage = viewModel::loadEpubImage,
+                                    onApplyHighlight = viewModel::applyHighlight,
+                                    onClearHighlight = viewModel::clearHighlightRange,
+                                    onBookmarkSelection = viewModel::toggleSelectionBookmark,
                                     onToggleHud = {
                                         if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
                                             viewModel.setSearchResultsExpanded(false)
@@ -241,7 +247,7 @@ fun ReaderScreen(
                                 pagerState = pagerState,
                                 settings = uiState.settings,
                                 palette = palette,
-                                bookmarkedPages = bookmarkedPages,
+                                bookmarkedPages = pdfBookmarkedPages,
                                 searchMatches = uiState.searchMatches,
                                 activeMatchIndex = uiState.activeMatchIndex,
                                 onToggleHud = {
@@ -355,6 +361,7 @@ fun ReaderScreen(
                 initialTab = tocSheetInitialTab,
                 tocEntries = uiState.tocEntries,
                 bookmarks = uiState.bookmarks,
+                highlights = uiState.highlights,
                 currentPage = uiState.currentPage,
                 onSelectTocEntry = { entry ->
                     viewModel.jumpToPage(entry.pageIndex, recordReturnPoint = true, animate = false)
@@ -363,6 +370,10 @@ fun ReaderScreen(
                     viewModel.jumpToBookmark(bm)
                 },
                 onDeleteBookmark = viewModel::deleteBookmark,
+                onSelectHighlight = { hl ->
+                    viewModel.jumpToHighlight(hl)
+                },
+                onDeleteHighlight = viewModel::deleteHighlight,
                 onDismiss = { activeSheet = null }
             )
         }

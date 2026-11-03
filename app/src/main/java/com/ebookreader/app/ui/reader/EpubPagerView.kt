@@ -3,7 +3,12 @@ package com.ebookreader.app.ui.reader
 import android.graphics.Bitmap
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -18,99 +23,248 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.BookmarkBorder
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.FormatColorReset
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
+import com.ebookreader.app.data.parser.epub.ChapterTextSelection
+import com.ebookreader.app.data.parser.epub.EpubBook
+import com.ebookreader.app.data.parser.epub.EpubChapter
 import com.ebookreader.app.data.parser.epub.EpubPage
 import com.ebookreader.app.data.parser.epub.EpubPageItem
 import com.ebookreader.app.data.parser.epub.EpubPaginator
+import com.ebookreader.app.data.parser.epub.EpubSelectionHelper
 import com.ebookreader.app.data.parser.epub.EpubTextKind
+import com.ebookreader.app.domain.model.Bookmark
+import com.ebookreader.app.domain.model.HighlightColor
 import com.ebookreader.app.domain.model.ReaderSettings
 import com.ebookreader.app.domain.model.SearchMatch
+import com.ebookreader.app.domain.model.TextHighlight
 import com.ebookreader.app.ui.theme.ReaderPalette
 import kotlinx.coroutines.launch
+import kotlin.math.abs
+
+private data class SliceHitTarget(
+    val slice: EpubPageItem.TextSlice,
+    val layoutResult: TextLayoutResult,
+    val coords: LayoutCoordinates
+)
 
 @Composable
 fun EpubPagerView(
+    epubBook: EpubBook,
     pages: List<EpubPage>,
     pagerState: PagerState,
     settings: ReaderSettings,
     palette: ReaderPalette,
-    bookmarkedPages: Set<Int>,
+    bookmarks: List<Bookmark>,
+    highlights: List<TextHighlight>,
     searchMatches: List<SearchMatch>,
     activeMatchIndex: Int,
     loadImage: suspend (String) -> Bitmap?,
+    onApplyHighlight: (chapterIndex: Int, startOffset: Int, endOffset: Int, selectedText: String, color: HighlightColor) -> Unit,
+    onClearHighlight: (chapterIndex: Int, startOffset: Int, endOffset: Int) -> Unit,
+    onBookmarkSelection: (chapterIndex: Int, startOffset: Int, endOffset: Int, selectedText: String) -> Unit,
     onToggleHud: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val coroutineScope = rememberCoroutineScope()
+    var activeSelection by remember { mutableStateOf<ChapterTextSelection?>(null) }
+    var selectionAnchorOffset by remember { mutableIntStateOf(0) }
+    var selectionPlacedNearTop by remember { mutableStateOf(false) }
+
+    // Clear live text selection if the user navigates to another page
+    LaunchedEffect(pagerState.currentPage) {
+        activeSelection = null
+    }
+
+    val pageBookmarksSet = remember(bookmarks) {
+        bookmarks.filter { !it.isTextSelection }.map { it.pageIndex }.toSet()
+    }
 
     HorizontalPager(
         state = pagerState,
         beyondViewportPageCount = 1,
+        userScrollEnabled = activeSelection == null,
         modifier = modifier
             .fillMaxSize()
             .background(palette.background)
-            .pointerInput(pages.size) {
-                detectTapGestures { offset ->
-                    val width = size.width.toFloat().coerceAtLeast(1f)
-                    val xFraction = offset.x / width
-                    when {
-                        xFraction < 0.20f -> {
-                            val prev = pagerState.currentPage - 1
-                            if (prev >= 0) {
-                                coroutineScope.launch { pagerState.animateScrollToPage(prev) }
-                            } else {
-                                onToggleHud()
-                            }
-                        }
-                        xFraction > 0.80f -> {
-                            val next = pagerState.currentPage + 1
-                            if (next < pages.size) {
-                                coroutineScope.launch { pagerState.animateScrollToPage(next) }
-                            } else {
-                                onToggleHud()
-                            }
-                        }
-                        else -> onToggleHud()
-                    }
-                }
-            }
     ) { pageIndex ->
         val page = pages.getOrNull(pageIndex)
         if (page != null) {
+            val chapter = epubBook.chapters.getOrNull(page.chapterIndex)
+            val sliceTargets = remember(pageIndex, page) { mutableStateMapOf<Int, SliceHitTarget>() }
+            var pageBoxCoords by remember(pageIndex) { mutableStateOf<LayoutCoordinates?>(null) }
+
             val pageMatches = remember(searchMatches, pageIndex) {
                 searchMatches.filter { it.pageIndex == pageIndex }
             }
             val activeMatch = searchMatches.getOrNull(activeMatchIndex)
                 ?.takeIf { it.pageIndex == pageIndex }
 
-            Box(modifier = Modifier.fillMaxSize()) {
+            val chapterHighlights = remember(highlights, page.chapterIndex) {
+                highlights.filter { it.chapterIndex == page.chapterIndex }
+            }
+            val chapterSelectionBookmarks = remember(bookmarks, page.chapterIndex) {
+                bookmarks.filter { it.isTextSelection && it.epubChapterIndex == page.chapterIndex }
+            }
+
+            val currentSelectionOnPage = activeSelection?.takeIf {
+                pageIndex == pagerState.currentPage && it.chapterIndex == page.chapterIndex
+            }
+
+            val currentChapterUpdated by rememberUpdatedState(chapter)
+            val currentSelectionUpdated by rememberUpdatedState(activeSelection)
+            val pagesSizeUpdated by rememberUpdatedState(pages.size)
+
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .onGloballyPositioned { pageBoxCoords = it }
+                    .pointerInput(pageIndex) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            val downPos = down.position
+                            val longPress = awaitLongPressOrCancellation(down.id)
+
+                            if (longPress != null) {
+                                val ch = currentChapterUpdated
+                                val box = pageBoxCoords
+                                if (ch != null && box != null) {
+                                    val hit = resolveChapterOffsetAtPosition(
+                                        touchInPageBox = longPress.position,
+                                        pageBoxCoords = box,
+                                        targets = sliceTargets.values
+                                    )
+                                    if (hit != null) {
+                                        selectionAnchorOffset = hit
+                                        selectionPlacedNearTop = longPress.position.y < size.height * 0.32f
+                                        val (sStart, sEnd) = EpubSelectionHelper.expandToSentence(
+                                            ch.plainText,
+                                            hit
+                                        )
+                                        if (sEnd > sStart) {
+                                            activeSelection = ChapterTextSelection(
+                                                chapterIndex = ch.index,
+                                                startCharOffset = sStart,
+                                                endCharOffset = sEnd,
+                                                selectedText = ch.plainText.substring(sStart, sEnd)
+                                            )
+                                        }
+                                        var didDragMove = false
+                                        drag(longPress.id) { change ->
+                                            val moveDist = (change.position - longPress.position).getDistance()
+                                            if (moveDist > viewConfiguration.touchSlop * 0.6f) {
+                                                didDragMove = true
+                                            }
+                                            change.consume()
+                                            if (didDragMove) {
+                                                val dragHit = resolveChapterOffsetAtPosition(
+                                                    touchInPageBox = change.position,
+                                                    pageBoxCoords = box,
+                                                    targets = sliceTargets.values
+                                                )
+                                                if (dragHit != null) {
+                                                    val range = expandRangeToWordBoundaries(
+                                                        chapterText = ch.plainText,
+                                                        offsetA = selectionAnchorOffset,
+                                                        offsetB = dragHit
+                                                    )
+                                                    if (range.second > range.first) {
+                                                        activeSelection = ChapterTextSelection(
+                                                            chapterIndex = ch.index,
+                                                            startCharOffset = range.first,
+                                                            endCharOffset = range.second,
+                                                            selectedText = ch.plainText.substring(
+                                                                range.first,
+                                                                range.second
+                                                            )
+                                                        )
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                val changes = currentEvent.changes
+                                val releasedCleanly = changes.all { !it.pressed } &&
+                                    changes.none { it.isConsumed }
+                                val upPos = changes.firstOrNull()?.position ?: downPos
+                                val withinSlop = (upPos - downPos).getDistance() <= viewConfiguration.touchSlop * 1.5f
+
+                                if (releasedCleanly && withinSlop) {
+                                    if (currentSelectionUpdated != null) {
+                                        activeSelection = null
+                                    } else {
+                                        val width = size.width.toFloat().coerceAtLeast(1f)
+                                        val xFraction = downPos.x / width
+                                        when {
+                                            xFraction < 0.20f -> {
+                                                val prev = pagerState.currentPage - 1
+                                                if (prev >= 0) {
+                                                    coroutineScope.launch { pagerState.animateScrollToPage(prev) }
+                                                } else {
+                                                    onToggleHud()
+                                                }
+                                            }
+                                            xFraction > 0.80f -> {
+                                                val next = pagerState.currentPage + 1
+                                                if (next < pagesSizeUpdated) {
+                                                    coroutineScope.launch { pagerState.animateScrollToPage(next) }
+                                                } else {
+                                                    onToggleHud()
+                                                }
+                                            }
+                                            else -> onToggleHud()
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+            ) {
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(horizontal = 22.dp, vertical = 12.dp)
                 ) {
-                    page.items.forEach { item ->
+                    page.items.forEachIndexed { itemIdx, item ->
                         when (item) {
                             is EpubPageItem.TextSlice -> {
                                 val style = EpubPaginator.textStyleForKind(item.kind, settings)
@@ -118,15 +272,21 @@ fun EpubPagerView(
 
                                 val displayAnnotated = remember(
                                     item,
+                                    chapterHighlights,
+                                    chapterSelectionBookmarks,
                                     pageMatches,
                                     activeMatch,
+                                    currentSelectionOnPage,
                                     palette
                                 ) {
-                                    applySearchHighlights(
+                                    buildDecoratedSliceText(
                                         slice = item,
                                         chapterIndex = page.chapterIndex,
+                                        chapterHighlights = chapterHighlights,
+                                        chapterSelectionBookmarks = chapterSelectionBookmarks,
                                         pageMatches = pageMatches,
                                         activeMatch = activeMatch,
+                                        activeSelection = currentSelectionOnPage,
                                         palette = palette
                                     )
                                 }
@@ -136,6 +296,13 @@ fun EpubPagerView(
                                     EpubTextKind.HEADING_2,
                                     EpubTextKind.HEADING_3 -> 16.dp
                                     else -> 12.dp
+                                }
+
+                                var latestLayout by remember(itemIdx, item) {
+                                    mutableStateOf<TextLayoutResult?>(null)
+                                }
+                                var latestCoords by remember(itemIdx, item) {
+                                    mutableStateOf<LayoutCoordinates?>(null)
                                 }
 
                                 if (item.kind == EpubTextKind.QUOTE) {
@@ -155,16 +322,41 @@ fun EpubPagerView(
                                             text = displayAnnotated,
                                             style = style,
                                             color = palette.onBackground.copy(alpha = 0.9f),
-                                            modifier = Modifier.weight(1f)
+                                            onTextLayout = { res ->
+                                                latestLayout = res
+                                                latestCoords?.let { c ->
+                                                    sliceTargets[itemIdx] = SliceHitTarget(item, res, c)
+                                                }
+                                            },
+                                            modifier = Modifier
+                                                .weight(1f)
+                                                .onGloballyPositioned { coords ->
+                                                    latestCoords = coords
+                                                    latestLayout?.let { res ->
+                                                        sliceTargets[itemIdx] = SliceHitTarget(item, res, coords)
+                                                    }
+                                                }
                                         )
                                     }
                                 } else {
                                     Text(
                                         text = displayAnnotated,
                                         style = style,
+                                        onTextLayout = { res ->
+                                            latestLayout = res
+                                            latestCoords?.let { c ->
+                                                sliceTargets[itemIdx] = SliceHitTarget(item, res, c)
+                                            }
+                                        },
                                         modifier = Modifier
                                             .fillMaxWidth()
                                             .padding(bottom = gapDp)
+                                            .onGloballyPositioned { coords ->
+                                                latestCoords = coords
+                                                latestLayout?.let { res ->
+                                                    sliceTargets[itemIdx] = SliceHitTarget(item, res, coords)
+                                                }
+                                            }
                                     )
                                 }
                             }
@@ -198,7 +390,7 @@ fun EpubPagerView(
                     }
                 }
 
-                if (pageIndex in bookmarkedPages) {
+                if (pageIndex in pageBookmarksSet) {
                     Icon(
                         imageVector = Icons.Default.Bookmark,
                         contentDescription = "Bookmarked page",
@@ -209,9 +401,229 @@ fun EpubPagerView(
                             .size(24.dp)
                     )
                 }
+
+                if (currentSelectionOnPage != null && chapter != null) {
+                    val hasOverlappingHighlight = chapterHighlights.any { hl ->
+                        hl.startCharOffset < currentSelectionOnPage.endCharOffset &&
+                            hl.endCharOffset > currentSelectionOnPage.startCharOffset
+                    }
+                    val isExactSelectionBookmarked = chapterSelectionBookmarks.any { bm ->
+                        bm.epubCharOffset == currentSelectionOnPage.startCharOffset &&
+                            bm.epubEndCharOffset == currentSelectionOnPage.endCharOffset
+                    }
+
+                    SelectionFloatingBar(
+                        selection = currentSelectionOnPage,
+                        chapter = chapter,
+                        palette = palette,
+                        hasOverlappingHighlight = hasOverlappingHighlight,
+                        isSelectionBookmarked = isExactSelectionBookmarked,
+                        onUpdateSelection = { activeSelection = it },
+                        onPickHighlightColor = { color ->
+                            onApplyHighlight(
+                                currentSelectionOnPage.chapterIndex,
+                                currentSelectionOnPage.startCharOffset,
+                                currentSelectionOnPage.endCharOffset,
+                                currentSelectionOnPage.selectedText,
+                                color
+                            )
+                            activeSelection = null
+                        },
+                        onClearHighlight = {
+                            onClearHighlight(
+                                currentSelectionOnPage.chapterIndex,
+                                currentSelectionOnPage.startCharOffset,
+                                currentSelectionOnPage.endCharOffset
+                            )
+                            activeSelection = null
+                        },
+                        onBookmarkSelection = {
+                            onBookmarkSelection(
+                                currentSelectionOnPage.chapterIndex,
+                                currentSelectionOnPage.startCharOffset,
+                                currentSelectionOnPage.endCharOffset,
+                                currentSelectionOnPage.selectedText
+                            )
+                            activeSelection = null
+                        },
+                        onDismiss = { activeSelection = null },
+                        modifier = Modifier
+                            .align(if (selectionPlacedNearTop) Alignment.BottomCenter else Alignment.TopCenter)
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                    )
+                }
             }
         }
     }
+}
+
+@Composable
+private fun SelectionFloatingBar(
+    selection: ChapterTextSelection,
+    chapter: EpubChapter,
+    palette: ReaderPalette,
+    hasOverlappingHighlight: Boolean,
+    isSelectionBookmarked: Boolean,
+    onUpdateSelection: (ChapterTextSelection) -> Unit,
+    onPickHighlightColor: (HighlightColor) -> Unit,
+    onClearHighlight: () -> Unit,
+    onBookmarkSelection: () -> Unit,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        shape = RoundedCornerShape(18.dp),
+        color = palette.hudContainer,
+        contentColor = palette.onHudContainer,
+        tonalElevation = 8.dp,
+        shadowElevation = 10.dp,
+        modifier = modifier
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // Quick expand pills: Sentence | Paragraph
+                ExpandScopeChip(
+                    label = "Sentence",
+                    palette = palette,
+                    onClick = {
+                        val (s, e) = EpubSelectionHelper.expandToSentence(
+                            chapter.plainText,
+                            selection.startCharOffset
+                        )
+                        if (e > s) {
+                            onUpdateSelection(
+                                selection.copy(
+                                    startCharOffset = s,
+                                    endCharOffset = e,
+                                    selectedText = chapter.plainText.substring(s, e)
+                                )
+                            )
+                        }
+                    }
+                )
+                ExpandScopeChip(
+                    label = "Paragraph",
+                    palette = palette,
+                    onClick = {
+                        val (s, e) = EpubSelectionHelper.expandToParagraph(
+                            chapter,
+                            selection.startCharOffset
+                        )
+                        if (e > s) {
+                            onUpdateSelection(
+                                selection.copy(
+                                    startCharOffset = s,
+                                    endCharOffset = e,
+                                    selectedText = chapter.plainText.substring(s, e)
+                                )
+                            )
+                        }
+                    }
+                )
+
+                Spacer(Modifier.weight(1f))
+
+                // Bookmark selected sentence / paragraph (no margin notes)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(palette.accent.copy(alpha = 0.16f))
+                        .clickable(onClick = onBookmarkSelection)
+                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                ) {
+                    Icon(
+                        imageVector = if (isSelectionBookmarked) {
+                            Icons.Default.Bookmark
+                        } else {
+                            Icons.Default.BookmarkBorder
+                        },
+                        contentDescription = "Bookmark selection",
+                        tint = palette.accent,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = if (isSelectionBookmarked) "Saved" else "Bookmark",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = palette.accent
+                    )
+                }
+
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Close selection",
+                        modifier = Modifier.size(16.dp)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Text(
+                    text = "Highlight:",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = palette.onHudContainer.copy(alpha = 0.75f)
+                )
+                HighlightColor.entries.forEach { color ->
+                    val swatchSolid = Color((color.argbHex or 0xFF000000L))
+                    Box(
+                        modifier = Modifier
+                            .size(24.dp)
+                            .clip(CircleShape)
+                            .background(swatchSolid)
+                            .border(1.dp, palette.onHudContainer.copy(alpha = 0.35f), CircleShape)
+                            .clickable { onPickHighlightColor(color) }
+                    )
+                }
+                if (hasOverlappingHighlight) {
+                    IconButton(
+                        onClick = onClearHighlight,
+                        modifier = Modifier.size(28.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.FormatColorReset,
+                            contentDescription = "Remove highlight",
+                            tint = palette.onHudContainer,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExpandScopeChip(
+    label: String,
+    palette: ReaderPalette,
+    onClick: () -> Unit
+) {
+    Text(
+        text = label,
+        style = MaterialTheme.typography.labelMedium,
+        color = palette.onHudContainer,
+        modifier = Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(palette.onHudContainer.copy(alpha = 0.1f))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 9.dp, vertical = 5.dp)
+    )
 }
 
 @Composable
@@ -246,24 +658,140 @@ private fun EpubInlineImage(
     }
 }
 
-private fun applySearchHighlights(
+private fun resolveChapterOffsetAtPosition(
+    touchInPageBox: Offset,
+    pageBoxCoords: LayoutCoordinates,
+    targets: Collection<SliceHitTarget>
+): Int? {
+    if (!pageBoxCoords.isAttached || targets.isEmpty()) return null
+    val validTargets = targets.filter { it.coords.isAttached }
+    if (validTargets.isEmpty()) return null
+
+    var bestTarget: SliceHitTarget? = null
+    var bestDistanceY = Float.MAX_VALUE
+    var bestLocalOffset = Offset.Zero
+
+    for (target in validTargets) {
+        val local = target.coords.localPositionOf(pageBoxCoords, touchInPageBox)
+        val w = target.coords.size.width.toFloat()
+        val h = target.coords.size.height.toFloat()
+        val dy = when {
+            local.y < 0f -> -local.y
+            local.y > h -> local.y - h
+            else -> 0f
+        }
+        val dx = when {
+            local.x < 0f -> -local.x
+            local.x > w -> local.x - w
+            else -> 0f
+        }
+        val score = dy * 2f + dx * 0.25f
+        if (score < bestDistanceY) {
+            bestDistanceY = score
+            bestTarget = target
+            bestLocalOffset = Offset(
+                x = local.x.coerceIn(0f, w.coerceAtLeast(1f)),
+                y = local.y.coerceIn(0f, h.coerceAtLeast(1f))
+            )
+        }
+    }
+
+    val chosen = bestTarget ?: return null
+    if (bestDistanceY > 140f) return null
+    val localCharIdx = chosen.layoutResult.getOffsetForPosition(bestLocalOffset)
+        .coerceIn(0, chosen.slice.text.length)
+    return chosen.slice.chapterCharStart + localCharIdx
+}
+
+private fun expandRangeToWordBoundaries(
+    chapterText: String,
+    offsetA: Int,
+    offsetB: Int
+): Pair<Int, Int> {
+    if (chapterText.isEmpty()) return 0 to 0
+    var start = minOf(offsetA, offsetB).coerceIn(0, chapterText.lastIndex)
+    var end = maxOf(offsetA, offsetB).coerceIn(0, chapterText.length)
+
+    while (start > 0 && !chapterText[start - 1].isWhitespace()) {
+        start--
+    }
+    while (end < chapterText.length && !chapterText[end].isWhitespace()) {
+        end++
+    }
+    while (start < end && chapterText[start].isWhitespace()) start++
+    while (end > start && chapterText[end - 1].isWhitespace()) end--
+    return start to end
+}
+
+private fun buildDecoratedSliceText(
     slice: EpubPageItem.TextSlice,
     chapterIndex: Int,
+    chapterHighlights: List<TextHighlight>,
+    chapterSelectionBookmarks: List<Bookmark>,
     pageMatches: List<SearchMatch>,
     activeMatch: SearchMatch?,
+    activeSelection: ChapterTextSelection?,
     palette: ReaderPalette
 ): AnnotatedString {
-    if (pageMatches.isEmpty() || slice.text.text.isEmpty()) return slice.text
+    if (slice.text.text.isEmpty()) return slice.text
 
-    val relevant = pageMatches.filter { match ->
+    val overlappingHighlights = chapterHighlights.filter { hl ->
+        hl.startCharOffset < slice.chapterCharEnd && hl.endCharOffset > slice.chapterCharStart
+    }
+    val overlappingBookmarks = chapterSelectionBookmarks.filter { bm ->
+        bm.epubCharOffset < slice.chapterCharEnd && bm.epubEndCharOffset > slice.chapterCharStart
+    }
+    val overlappingMatches = pageMatches.filter { match ->
         match.chapterIndex == chapterIndex &&
             match.charOffsetInChapter < slice.chapterCharEnd &&
             (match.charOffsetInChapter + match.matchLength) > slice.chapterCharStart
     }
-    if (relevant.isEmpty()) return slice.text
+    val selectionOverlaps = activeSelection != null &&
+        activeSelection.chapterIndex == chapterIndex &&
+        activeSelection.startCharOffset < slice.chapterCharEnd &&
+        activeSelection.endCharOffset > slice.chapterCharStart
+
+    if (overlappingHighlights.isEmpty() &&
+        overlappingBookmarks.isEmpty() &&
+        overlappingMatches.isEmpty() &&
+        !selectionOverlaps
+    ) {
+        return slice.text
+    }
 
     val builder = AnnotatedString.Builder(slice.text)
-    for (match in relevant) {
+
+    // 1. Saved colored text highlights
+    for (hl in overlappingHighlights) {
+        val localStart = (hl.startCharOffset - slice.chapterCharStart).coerceIn(0, slice.text.length)
+        val localEnd = (hl.endCharOffset - slice.chapterCharStart).coerceIn(localStart, slice.text.length)
+        if (localEnd > localStart) {
+            builder.addStyle(
+                style = SpanStyle(background = Color(hl.color.argbHex)),
+                start = localStart,
+                end = localEnd
+            )
+        }
+    }
+
+    // 2. Saved passage/sentence bookmarks (subtle accent underline + soft tint)
+    for (bm in overlappingBookmarks) {
+        val localStart = (bm.epubCharOffset - slice.chapterCharStart).coerceIn(0, slice.text.length)
+        val localEnd = (bm.epubEndCharOffset - slice.chapterCharStart).coerceIn(localStart, slice.text.length)
+        if (localEnd > localStart) {
+            builder.addStyle(
+                style = SpanStyle(
+                    background = palette.accent.copy(alpha = 0.12f),
+                    textDecoration = TextDecoration.Underline
+                ),
+                start = localStart,
+                end = localEnd
+            )
+        }
+    }
+
+    // 3. In-book search matches
+    for (match in overlappingMatches) {
         val localStart = (match.charOffsetInChapter - slice.chapterCharStart)
             .coerceIn(0, slice.text.length)
         val localEnd = (match.charOffsetInChapter + match.matchLength - slice.chapterCharStart)
@@ -280,5 +808,23 @@ private fun applySearchHighlights(
             )
         }
     }
+
+    // 4. Live active text selection range
+    if (selectionOverlaps) {
+        activeSelection?.let { sel ->
+            val localStart = (sel.startCharOffset - slice.chapterCharStart)
+                .coerceIn(0, slice.text.length)
+            val localEnd = (sel.endCharOffset - slice.chapterCharStart)
+                .coerceIn(localStart, slice.text.length)
+            if (localEnd > localStart) {
+                builder.addStyle(
+                    style = SpanStyle(background = palette.accent.copy(alpha = 0.28f)),
+                    start = localStart,
+                    end = localEnd
+                )
+            }
+        }
+    }
+
     return builder.toAnnotatedString()
 }

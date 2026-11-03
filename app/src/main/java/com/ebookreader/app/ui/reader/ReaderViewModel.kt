@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.util.LruCache
 import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.unit.Density
@@ -12,8 +13,10 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.ebookreader.app.data.local.ReaderPreferencesRepository
 import com.ebookreader.app.data.parser.epub.EpubBook
+import com.ebookreader.app.data.parser.epub.EpubPage
 import com.ebookreader.app.data.parser.epub.EpubPaginator
 import com.ebookreader.app.data.parser.epub.EpubParser
+import com.ebookreader.app.data.parser.epub.EpubRandomAccessArchive
 import com.ebookreader.app.data.parser.epub.EpubSearchEngine
 import com.ebookreader.app.data.parser.epub.PaginatedEpub
 import com.ebookreader.app.data.parser.pdf.PdfDocumentController
@@ -22,11 +25,13 @@ import com.ebookreader.app.data.repository.LibraryRepository
 import com.ebookreader.app.domain.model.Book
 import com.ebookreader.app.domain.model.BookFormat
 import com.ebookreader.app.domain.model.Bookmark
+import com.ebookreader.app.domain.model.HighlightColor
 import com.ebookreader.app.domain.model.ReaderFontFamily
 import com.ebookreader.app.domain.model.ReaderSettings
 import com.ebookreader.app.domain.model.ReaderTheme
 import com.ebookreader.app.domain.model.ReadingProgressCalculator
 import com.ebookreader.app.domain.model.SearchMatch
+import com.ebookreader.app.domain.model.TextHighlight
 import com.ebookreader.app.domain.model.TocEntry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -42,6 +47,8 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
+import java.io.FileInputStream
 import java.io.FileNotFoundException
 import kotlin.math.abs
 
@@ -49,12 +56,14 @@ data class ReaderUiState(
     val book: Book? = null,
     val isLoading: Boolean = true,
     val isPaginating: Boolean = false,
+    val isBackgroundPaginating: Boolean = false,
     val errorMessage: String? = null,
     val epubBook: EpubBook? = null,
     val paginatedEpub: PaginatedEpub? = null,
     val pdfController: PdfDocumentController? = null,
     val tocEntries: List<TocEntry> = emptyList(),
     val bookmarks: List<Bookmark> = emptyList(),
+    val highlights: List<TextHighlight> = emptyList(),
     val currentPage: Int = 0,
     val totalPages: Int = 0,
     val progress: Float = 0f,
@@ -69,7 +78,7 @@ data class ReaderUiState(
     val activeMatchIndex: Int = -1
 ) {
     val isCurrentPageBookmarked: Boolean
-        get() = bookmarks.any { it.pageIndex == currentPage }
+        get() = bookmarks.any { !it.isTextSelection && it.pageIndex == currentPage }
 }
 
 sealed interface ReaderEffect {
@@ -101,6 +110,11 @@ class ReaderViewModel(
     private var initialPositionRestored: Boolean = false
     private var savedAnchorChapter: Int = 0
     private var savedAnchorCharOffset: Int = 0
+    private var pendingScrollTarget: Int? = null
+
+    private var epubPfd: ParcelFileDescriptor? = null
+    private var epubFis: FileInputStream? = null
+    private var epubArchive: EpubRandomAccessArchive? = null
 
     private val epubImageCache = object : LruCache<String, Bitmap>(12 * 1024) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount / 1024
@@ -109,6 +123,7 @@ class ReaderViewModel(
     init {
         observePreferences()
         observeBookmarks()
+        observeHighlights()
         loadBook()
     }
 
@@ -124,6 +139,14 @@ class ReaderViewModel(
         viewModelScope.launch {
             libraryRepository.observeBookmarks(bookId).collect { list ->
                 _uiState.update { it.copy(bookmarks = list) }
+            }
+        }
+    }
+
+    private fun observeHighlights() {
+        viewModelScope.launch {
+            libraryRepository.observeHighlights(bookId).collect { list ->
+                _uiState.update { it.copy(highlights = list) }
             }
         }
     }
@@ -186,7 +209,7 @@ class ReaderViewModel(
                 )
             }
             initialPositionRestored = true
-            _effects.emit(ReaderEffect.ScrollToPage(startPage, animate = false))
+            requestScrollToPage(startPage, animate = false)
             scheduleProgressSave(startPage, total, startPage, 0)
 
             // Load PDF outline asynchronously so first page renders immediately
@@ -217,13 +240,29 @@ class ReaderViewModel(
         runCatching {
             val uri = Uri.parse(book.fileUri)
             val parsedEpub = withContext(Dispatchers.IO) {
-                EpubParser.parseBook(
-                    inputStreamProvider = {
-                        appContext.contentResolver.openInputStream(uri)
-                            ?: throw FileNotFoundException("Unable to read EPUB URI: $uri")
-                    },
-                    fallbackTitle = book.title
-                )
+                closeEpubArchive()
+                val pfd = runCatching { appContext.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
+                val fis = pfd?.let { runCatching { FileInputStream(it.fileDescriptor) }.getOrNull() }
+                val archive = fis?.let {
+                    EpubRandomAccessArchive.openOrNull(it.channel, closeChannelOnClose = false)
+                }
+
+                if (archive != null) {
+                    epubPfd = pfd
+                    epubFis = fis
+                    epubArchive = archive
+                    EpubParser.parseBook(archive = archive, fallbackTitle = book.title)
+                } else {
+                    runCatching { fis?.close() }
+                    runCatching { pfd?.close() }
+                    EpubParser.parseBook(
+                        inputStreamProvider = {
+                            appContext.contentResolver.openInputStream(uri)
+                                ?: throw FileNotFoundException("Unable to read EPUB URI: $uri")
+                        },
+                        fallbackTitle = book.title
+                    )
+                }
             }
             _uiState.update {
                 it.copy(
@@ -244,6 +283,12 @@ class ReaderViewModel(
         }
     }
 
+    /**
+     * Two-phase lazy windowed EPUB pagination:
+     * 1. Measures ONLY the active/anchor chapter first so the reader opens immediately.
+     * 2. Measures remaining chapters radially outward in the background and seamlessly
+     *    stitches them without losing the user's active paragraph anchor.
+     */
     fun onEpubViewportReady(
         widthPx: Int,
         heightPx: Int,
@@ -258,7 +303,7 @@ class ReaderViewModel(
         val signature = "$widthPx:$heightPx:${settings.fontSizeSp}:${settings.lineHeightMultiplier}:${settings.fontFamily.name}"
         if (signature == lastPaginationSignature && state.paginatedEpub != null) return
 
-        // Capture current anchor before re-paginating on font/size/rotation change
+        // Capture current paragraph anchor before re-paginating on font/size/rotation change
         state.paginatedEpub?.pages?.getOrNull(state.currentPage)?.let { currentPageObj ->
             if (initialPositionRestored) {
                 savedAnchorChapter = currentPageObj.chapterIndex
@@ -269,40 +314,102 @@ class ReaderViewModel(
         lastPaginationSignature = signature
         paginationJob?.cancel()
         paginationJob = viewModelScope.launch {
-            _uiState.update { it.copy(isPaginating = true) }
+            _uiState.update { it.copy(isPaginating = true, isBackgroundPaginating = false) }
 
-            val paginated = withContext(Dispatchers.Default) {
-                EpubPaginator.paginate(
-                    book = epub,
-                    textMeasurer = textMeasurer,
-                    viewportWidthPx = widthPx,
-                    viewportHeightPx = heightPx,
-                    density = density,
-                    settings = settings
-                )
+            val chapterCount = epub.chapters.size
+            val anchorChapter = if (!initialPositionRestored && (state.book == null || !state.book.isStarted)) {
+                0
+            } else {
+                savedAnchorChapter.coerceIn(0, (chapterCount - 1).coerceAtLeast(0))
             }
 
-            val total = paginated.pages.size.coerceAtLeast(1)
-            val targetPage = if (!initialPositionRestored) {
-                val book = state.book
-                if (book != null && book.isStarted) {
-                    paginated.findPageForAnchor(savedAnchorChapter, savedAnchorCharOffset)
-                } else {
-                    0
+            // Phase 1: Paginate only the anchor chapter for instant first-page display
+            val paginatedByChapter = LinkedHashMap<Int, List<EpubPage>>(chapterCount.coerceAtLeast(1))
+            val initialPaginated = withContext(Dispatchers.Default) {
+                val targetCh = epub.chapters.getOrNull(anchorChapter)
+                if (targetCh != null) {
+                    paginatedByChapter[anchorChapter] = EpubPaginator.paginateChapter(
+                        chapter = targetCh,
+                        textMeasurer = textMeasurer,
+                        viewportWidthPx = widthPx,
+                        viewportHeightPx = heightPx,
+                        density = density,
+                        settings = settings
+                    )
                 }
+                EpubPaginator.assemblePaginatedEpub(epub, paginatedByChapter)
+            }
+
+            val initialTotal = initialPaginated.pages.size.coerceAtLeast(1)
+            val initialTargetPage = if (!initialPositionRestored && (state.book == null || !state.book.isStarted)) {
+                0
             } else {
-                paginated.findPageForAnchor(savedAnchorChapter, savedAnchorCharOffset)
-            }.coerceIn(0, total - 1)
+                initialPaginated.findPageForAnchor(anchorChapter, savedAnchorCharOffset)
+            }.coerceIn(0, initialTotal - 1)
 
             initialPositionRestored = true
-            val pageObj = paginated.pages[targetPage]
-            val progress = ReadingProgressCalculator.computeProgress(targetPage, total)
+            val initialPageObj = initialPaginated.pages[initialTargetPage]
+            savedAnchorChapter = initialPageObj.chapterIndex
+            savedAnchorCharOffset = initialPageObj.startCharOffset
+            val hasMoreChapters = chapterCount > 1
 
-            // Re-map any active EPUB search matches to new page numbers
-            val remappedMatches = if (state.searchMatches.isNotEmpty()) {
-                state.searchMatches.map { match ->
+            _uiState.update {
+                it.copy(
+                    isPaginating = false,
+                    isBackgroundPaginating = hasMoreChapters,
+                    paginatedEpub = initialPaginated,
+                    tocEntries = initialPaginated.tocEntries,
+                    currentPage = initialTargetPage,
+                    totalPages = initialTotal,
+                    progress = ReadingProgressCalculator.computeProgress(initialTargetPage, initialTotal),
+                    currentChapterTitle = initialPageObj.chapterTitle
+                )
+            }
+            requestScrollToPage(initialTargetPage, animate = false)
+
+            if (!hasMoreChapters) {
+                scheduleProgressSave(
+                    currentPage = initialTargetPage,
+                    totalPages = initialTotal,
+                    chapterIndex = initialPageObj.chapterIndex,
+                    charOffset = initialPageObj.startCharOffset
+                )
+                return@launch
+            }
+
+            // Phase 2: Radially paginate remaining chapters in the background (+1, -1, +2, -2, ...)
+            val remainingOrder = EpubPaginator.radialChapterOrder(chapterCount, anchorChapter).drop(1)
+            val fullPaginated = withContext(Dispatchers.Default) {
+                for (chIdx in remainingOrder) {
+                    yield()
+                    val chapter = epub.chapters.getOrNull(chIdx) ?: continue
+                    paginatedByChapter[chIdx] = EpubPaginator.paginateChapter(
+                        chapter = chapter,
+                        textMeasurer = textMeasurer,
+                        viewportWidthPx = widthPx,
+                        viewportHeightPx = heightPx,
+                        density = density,
+                        settings = settings
+                    )
+                }
+                EpubPaginator.assemblePaginatedEpub(epub, paginatedByChapter)
+            }
+
+            val latestState = _uiState.value
+            val currentVisibleObj = latestState.paginatedEpub?.pages?.getOrNull(latestState.currentPage)
+            val activeChapter = currentVisibleObj?.chapterIndex ?: savedAnchorChapter
+            val activeOffset = currentVisibleObj?.startCharOffset ?: savedAnchorCharOffset
+
+            val fullTotal = fullPaginated.pages.size.coerceAtLeast(1)
+            val fullTargetPage = fullPaginated.findPageForAnchor(activeChapter, activeOffset)
+                .coerceIn(0, fullTotal - 1)
+            val fullPageObj = fullPaginated.pages[fullTargetPage]
+            val fullProgress = ReadingProgressCalculator.computeProgress(fullTargetPage, fullTotal)
+
+            val remappedMatches = if (latestState.searchMatches.isNotEmpty()) {
+                latestState.searchMatches.map { match ->
                     match.copy(
-                        pageIndex = paginated.findPageForAnchor(
+                        pageIndex = fullPaginated.findPageForAnchor(
                             match.chapterIndex,
                             match.charOffsetInChapter
                         )
@@ -314,28 +421,45 @@ class ReaderViewModel(
 
             _uiState.update {
                 it.copy(
-                    isPaginating = false,
-                    paginatedEpub = paginated,
-                    tocEntries = paginated.tocEntries,
-                    currentPage = targetPage,
-                    totalPages = total,
-                    progress = progress,
-                    currentChapterTitle = pageObj.chapterTitle,
+                    isBackgroundPaginating = false,
+                    paginatedEpub = fullPaginated,
+                    tocEntries = fullPaginated.tocEntries,
+                    currentPage = fullTargetPage,
+                    totalPages = fullTotal,
+                    progress = fullProgress,
+                    currentChapterTitle = fullPageObj.chapterTitle,
                     searchMatches = remappedMatches
                 )
             }
 
-            _effects.emit(ReaderEffect.ScrollToPage(targetPage, animate = false))
+            requestScrollToPage(fullTargetPage, animate = false)
             scheduleProgressSave(
-                currentPage = targetPage,
-                totalPages = total,
-                chapterIndex = pageObj.chapterIndex,
-                charOffset = pageObj.startCharOffset
+                currentPage = fullTargetPage,
+                totalPages = fullTotal,
+                chapterIndex = fullPageObj.chapterIndex,
+                charOffset = fullPageObj.startCharOffset
             )
         }
     }
 
+    private suspend fun requestScrollToPage(pageIndex: Int, animate: Boolean) {
+        pendingScrollTarget = pageIndex
+        _effects.emit(ReaderEffect.ScrollToPage(pageIndex, animate = animate))
+    }
+
+    fun onScrollEffectApplied(appliedPage: Int) {
+        if (pendingScrollTarget == appliedPage) {
+            pendingScrollTarget = null
+        }
+    }
+
     fun onPageSettled(pageIndex: Int) {
+        val pending = pendingScrollTarget
+        if (pending != null) {
+            if (pageIndex != pending) return
+            pendingScrollTarget = null
+        }
+
         val state = _uiState.value
         if (state.totalPages <= 0) return
         val clamped = pageIndex.coerceIn(0, state.totalPages - 1)
@@ -383,9 +507,10 @@ class ReaderViewModel(
             }
         }
 
+        pendingScrollTarget = null
         onPageSettled(clamped)
         viewModelScope.launch {
-            _effects.emit(ReaderEffect.ScrollToPage(clamped, animate = animate))
+            requestScrollToPage(clamped, animate = animate)
         }
     }
 
@@ -402,6 +527,16 @@ class ReaderViewModel(
             state.paginatedEpub.findPageForAnchor(bookmark.epubChapterIndex, bookmark.epubCharOffset)
         } else {
             bookmark.pageIndex
+        }
+        jumpToPage(resolvedPage, recordReturnPoint = true, animate = false)
+    }
+
+    fun jumpToHighlight(highlight: TextHighlight) {
+        val state = _uiState.value
+        val resolvedPage = if (state.book?.format == BookFormat.EPUB && state.paginatedEpub != null) {
+            state.paginatedEpub.findPageForAnchor(highlight.chapterIndex, highlight.startCharOffset)
+        } else {
+            highlight.pageIndex
         }
         jumpToPage(resolvedPage, recordReturnPoint = true, animate = false)
     }
@@ -451,9 +586,103 @@ class ReaderViewModel(
         }
     }
 
+    /**
+     * Bookmarks or un-bookmarks a user-selected sentence or paragraph range in an EPUB chapter
+     * (without margin notes).
+     */
+    fun toggleSelectionBookmark(
+        chapterIndex: Int,
+        startCharOffset: Int,
+        endCharOffset: Int,
+        selectedText: String
+    ) {
+        val state = _uiState.value
+        val book = state.book ?: return
+        if (selectedText.isBlank() || endCharOffset <= startCharOffset) return
+
+        viewModelScope.launch {
+            val pageIdx = state.paginatedEpub?.findPageForAnchor(chapterIndex, startCharOffset)
+                ?: state.currentPage
+            val chapterTitle = state.epubBook?.chapters?.getOrNull(chapterIndex)?.title
+                ?: state.currentChapterTitle.ifBlank { book.title }
+
+            val added = libraryRepository.toggleSelectionBookmark(
+                bookId = book.id,
+                pageIndex = pageIdx,
+                totalPages = state.totalPages.coerceAtLeast(1),
+                chapterIndex = chapterIndex,
+                startCharOffset = startCharOffset,
+                endCharOffset = endCharOffset,
+                chapterTitle = chapterTitle,
+                selectedText = selectedText
+            )
+            _effects.emit(
+                ReaderEffect.ShowSnackbar(
+                    if (added) "Selected passage bookmarked" else "Passage bookmark removed"
+                )
+            )
+        }
+    }
+
     fun deleteBookmark(bookmarkId: Long) {
         viewModelScope.launch {
             libraryRepository.deleteBookmark(bookmarkId)
+        }
+    }
+
+    // --- Inline Text Highlights (No Margin Notes) ---
+
+    fun applyHighlight(
+        chapterIndex: Int,
+        startCharOffset: Int,
+        endCharOffset: Int,
+        selectedText: String,
+        color: HighlightColor
+    ) {
+        val state = _uiState.value
+        val book = state.book ?: return
+        if (selectedText.isBlank() || endCharOffset <= startCharOffset) return
+
+        viewModelScope.launch {
+            val pageIdx = state.paginatedEpub?.findPageForAnchor(chapterIndex, startCharOffset)
+                ?: state.currentPage
+            val chapterTitle = state.epubBook?.chapters?.getOrNull(chapterIndex)?.title
+                ?: state.currentChapterTitle.ifBlank { book.title }
+
+            libraryRepository.saveHighlight(
+                bookId = book.id,
+                pageIndex = pageIdx,
+                chapterIndex = chapterIndex,
+                startCharOffset = startCharOffset,
+                endCharOffset = endCharOffset,
+                chapterTitle = chapterTitle,
+                selectedText = selectedText,
+                color = color
+            )
+            _effects.emit(ReaderEffect.ShowSnackbar("Highlighted (${color.label})"))
+        }
+    }
+
+    fun clearHighlightRange(
+        chapterIndex: Int,
+        startCharOffset: Int,
+        endCharOffset: Int
+    ) {
+        val book = _uiState.value.book ?: return
+        viewModelScope.launch {
+            libraryRepository.clearHighlightsInRange(
+                bookId = book.id,
+                chapterIndex = chapterIndex,
+                startCharOffset = startCharOffset,
+                endCharOffset = endCharOffset
+            )
+            _effects.emit(ReaderEffect.ShowSnackbar("Highlight removed"))
+        }
+    }
+
+    fun deleteHighlight(highlightId: Long) {
+        viewModelScope.launch {
+            libraryRepository.deleteHighlight(highlightId)
         }
     }
 
@@ -574,7 +803,7 @@ class ReaderViewModel(
         viewModelScope.launch { preferencesRepository.updatePdfInvertInDark(invert) }
     }
 
-    // --- EPUB On-Demand Image Loading ---
+    // --- EPUB On-Demand Image Loading (O(1) via Central Directory archive) ---
 
     suspend fun loadEpubImage(zipEntryPath: String): Bitmap? = withContext(Dispatchers.IO) {
         synchronized(epubImageCache) {
@@ -582,7 +811,7 @@ class ReaderViewModel(
         }
         val uriString = _uiState.value.book?.fileUri ?: return@withContext null
         val uri = Uri.parse(uriString)
-        val bytes = runCatching {
+        val bytes = epubArchive?.readEntry(zipEntryPath) ?: runCatching {
             EpubParser.readSingleZipEntry(
                 inputStreamProvider = {
                     appContext.contentResolver.openInputStream(uri)
@@ -661,11 +890,21 @@ class ReaderViewModel(
         }
     }
 
+    private fun closeEpubArchive() {
+        runCatching { epubArchive?.close() }
+        epubArchive = null
+        runCatching { epubFis?.close() }
+        epubFis = null
+        runCatching { epubPfd?.close() }
+        epubPfd = null
+    }
+
     override fun onCleared() {
         flushProgressImmediately()
         synchronized(epubImageCache) {
             epubImageCache.evictAll()
         }
+        closeEpubArchive()
         _uiState.value.pdfController?.close()
         super.onCleared()
     }
