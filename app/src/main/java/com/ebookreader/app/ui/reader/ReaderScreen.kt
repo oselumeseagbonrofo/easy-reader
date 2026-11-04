@@ -6,7 +6,6 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -49,9 +48,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -61,11 +58,9 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.ebookreader.app.domain.model.BookFormat
-import com.ebookreader.app.domain.model.PdfFitMode
 import com.ebookreader.app.ui.theme.ReaderPalette
 import com.ebookreader.app.ui.theme.readerPaletteFor
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -139,16 +134,6 @@ fun ReaderScreen(
                         ),
                         pageCount = { uiState.totalPages.coerceAtLeast(1) }
                     )
-
-                    var showInitialPdfFitPill by remember {
-                        mutableStateOf(uiState.book?.format == BookFormat.PDF)
-                    }
-                    LaunchedEffect(showInitialPdfFitPill, uiState.settings.pdfFitMode, uiState.settings.pdfTrimMargins) {
-                        if (showInitialPdfFitPill) {
-                            delay(4_000)
-                            showInitialPdfFitPill = false
-                        }
-                    }
 
                     val lifecycleOwner = LocalLifecycleOwner.current
                     DisposableEffect(lifecycleOwner, pagerState) {
@@ -284,7 +269,6 @@ fun ReaderScreen(
                                     searchMatches = uiState.searchMatches,
                                     activeMatchIndex = uiState.activeMatchIndex,
                                     onToggleHud = {
-                                        showInitialPdfFitPill = false
                                         if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
                                             viewModel.setSearchResultsExpanded(false)
                                         } else {
@@ -301,26 +285,6 @@ fun ReaderScreen(
                             progress = uiState.progress,
                             chapterTitle = uiState.currentChapterTitle,
                             palette = palette
-                        )
-                    }
-
-                    if (uiState.book?.format == BookFormat.PDF) {
-                        PdfFitQuickPill(
-                            visible = (showInitialPdfFitPill || isHudVisible) && !uiState.isSearchVisible,
-                            currentMode = uiState.settings.pdfFitMode,
-                            trimMargins = uiState.settings.pdfTrimMargins,
-                            palette = palette,
-                            onSelectMode = { mode ->
-                                showInitialPdfFitPill = true
-                                viewModel.setPdfFitMode(mode)
-                            },
-                            onToggleTrim = {
-                                showInitialPdfFitPill = true
-                                viewModel.setPdfTrimMargins(!uiState.settings.pdfTrimMargins)
-                            },
-                            modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .padding(bottom = if (isHudVisible) 138.dp else 44.dp)
                         )
                     }
 
@@ -452,68 +416,6 @@ fun ReaderScreen(
 private enum class ReaderModalSheet {
     TOC_BOOKMARKS,
     SETTINGS
-}
-
-@Composable
-private fun PdfFitQuickPill(
-    visible: Boolean,
-    currentMode: PdfFitMode,
-    trimMargins: Boolean,
-    palette: ReaderPalette,
-    onSelectMode: (PdfFitMode) -> Unit,
-    onToggleTrim: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    AnimatedVisibility(
-        visible = visible,
-        enter = fadeIn() + slideInVertically(initialOffsetY = { it / 2 }),
-        exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 2 }),
-        modifier = modifier
-    ) {
-        Surface(
-            shape = RoundedCornerShape(20.dp),
-            color = palette.hudContainer.copy(alpha = 0.94f),
-            contentColor = palette.onHudContainer,
-            tonalElevation = 6.dp,
-            shadowElevation = 6.dp
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
-            ) {
-                PdfFitMode.entries.forEach { mode ->
-                    val selected = currentMode == mode
-                    Text(
-                        text = mode.label,
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-                        color = if (selected) palette.hudContainer else palette.onHudContainer,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(
-                                if (selected) palette.accent else palette.onHudContainer.copy(alpha = 0.08f)
-                            )
-                            .clickable { onSelectMode(mode) }
-                            .padding(horizontal = 10.dp, vertical = 5.dp)
-                    )
-                }
-                if (currentMode != PdfFitMode.FIT_PAGE) {
-                    Text(
-                        text = if (trimMargins) "Crop ✓" else "Crop",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = if (trimMargins) FontWeight.SemiBold else FontWeight.Normal,
-                        color = if (trimMargins) palette.accent else palette.onHudContainer.copy(alpha = 0.7f),
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(palette.onHudContainer.copy(alpha = 0.08f))
-                            .clickable { onToggleTrim() }
-                            .padding(horizontal = 9.dp, vertical = 5.dp)
-                    )
-                }
-            }
-        }
-    }
 }
 
 @Composable
