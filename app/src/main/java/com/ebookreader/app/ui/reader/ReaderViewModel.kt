@@ -26,6 +26,7 @@ import com.ebookreader.app.domain.model.Book
 import com.ebookreader.app.domain.model.BookFormat
 import com.ebookreader.app.domain.model.Bookmark
 import com.ebookreader.app.domain.model.HighlightColor
+import com.ebookreader.app.domain.model.PdfFitMode
 import com.ebookreader.app.domain.model.ReaderFontFamily
 import com.ebookreader.app.domain.model.ReaderSettings
 import com.ebookreader.app.domain.model.ReaderTheme
@@ -37,6 +38,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -46,6 +48,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import java.io.FileInputStream
@@ -98,9 +102,13 @@ class ReaderViewModel(
     private val _uiState = MutableStateFlow(ReaderUiState())
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
 
-    private val _effects = MutableSharedFlow<ReaderEffect>(extraBufferCapacity = 8)
+    private val _effects = MutableSharedFlow<ReaderEffect>(
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
     val effects = _effects.asSharedFlow()
 
+    private val bookmarkActionMutex = Mutex()
     private var saveProgressJob: Job? = null
     private var searchJob: Job? = null
     private var returnChipTimeoutJob: Job? = null
@@ -209,11 +217,10 @@ class ReaderViewModel(
                 )
             }
             initialPositionRestored = true
-            requestScrollToPage(startPage, animate = false)
-            scheduleProgressSave(startPage, total, startPage, 0)
 
-            // Load PDF outline asynchronously so first page renders immediately
+            // Delay outline parsing slightly so the active PDF page renders without IO/heap contention
             viewModelScope.launch {
+                delay(280)
                 val outline = controller.extractOutline()
                 if (outline.isNotEmpty()) {
                     _uiState.update { state ->
@@ -448,8 +455,16 @@ class ReaderViewModel(
     }
 
     fun onScrollEffectApplied(appliedPage: Int) {
-        if (pendingScrollTarget == appliedPage) {
+        pendingScrollTarget = null
+    }
+
+    fun syncCurrentPageBeforeExit(livePageIndex: Int) {
+        val state = _uiState.value
+        if (state.isLoading || state.isPaginating || state.totalPages <= 0) return
+        val clamped = livePageIndex.coerceIn(0, state.totalPages - 1)
+        if (clamped != state.currentPage) {
             pendingScrollTarget = null
+            onPageSettled(clamped)
         }
     }
 
@@ -542,47 +557,58 @@ class ReaderViewModel(
     }
 
     fun toggleBookmarkAtCurrentPage() {
-        val state = _uiState.value
-        val book = state.book ?: return
-        if (state.totalPages <= 0) return
+        val initialState = _uiState.value
+        if (initialState.book == null || initialState.totalPages <= 0) return
+        val targetPageIdx = initialState.currentPage
 
         viewModelScope.launch {
-            val pageIdx = state.currentPage
-            val (chapterIdx, charOffset, chapterTitle, snippet) = when (book.format) {
-                BookFormat.EPUB -> {
-                    val page = state.paginatedEpub?.pages?.getOrNull(pageIdx)
-                    BookmarkCapture(
-                        chapterIdx = page?.chapterIndex ?: 0,
-                        charOffset = page?.startCharOffset ?: 0,
-                        chapterTitle = page?.chapterTitle ?: book.title,
-                        snippet = page?.previewText ?: "Page ${pageIdx + 1}"
-                    )
-                }
-                BookFormat.PDF -> {
-                    val excerpt = state.pdfController?.extractPageSnippet(pageIdx).orEmpty()
-                    BookmarkCapture(
-                        chapterIdx = pageIdx,
-                        charOffset = 0,
-                        chapterTitle = state.currentChapterTitle.ifBlank { "Page ${pageIdx + 1}" },
-                        snippet = excerpt.ifBlank { "Page ${pageIdx + 1}" }
-                    )
-                }
-            }
+            bookmarkActionMutex.withLock {
+                val state = _uiState.value
+                val book = state.book ?: return@withLock
+                if (state.totalPages <= 0) return@withLock
+                val pageIdx = targetPageIdx.coerceIn(0, state.totalPages - 1)
+                val alreadyBookmarked = state.bookmarks.any { !it.isTextSelection && it.pageIndex == pageIdx }
 
-            val added = libraryRepository.toggleBookmark(
-                bookId = book.id,
-                pageIndex = pageIdx,
-                totalPages = state.totalPages,
-                epubChapterIndex = chapterIdx,
-                epubCharOffset = charOffset,
-                chapterTitle = chapterTitle,
-                snippet = snippet
-            )
-            _effects.emit(
-                ReaderEffect.ShowSnackbar(
-                    if (added) "Bookmark saved for page ${pageIdx + 1}" else "Bookmark removed"
+                val (chapterIdx, charOffset, chapterTitle, snippet) = when (book.format) {
+                    BookFormat.EPUB -> {
+                        val page = state.paginatedEpub?.pages?.getOrNull(pageIdx)
+                        BookmarkCapture(
+                            chapterIdx = page?.chapterIndex ?: 0,
+                            charOffset = page?.startCharOffset ?: 0,
+                            chapterTitle = page?.chapterTitle ?: book.title,
+                            snippet = page?.previewText ?: "Page ${pageIdx + 1}"
+                        )
+                    }
+                    BookFormat.PDF -> {
+                        val excerpt = if (alreadyBookmarked) {
+                            ""
+                        } else {
+                            state.pdfController?.extractPageSnippet(pageIdx).orEmpty()
+                        }
+                        BookmarkCapture(
+                            chapterIdx = pageIdx,
+                            charOffset = 0,
+                            chapterTitle = resolvePdfSectionTitle(state.tocEntries, pageIdx),
+                            snippet = excerpt.ifBlank { "Page ${pageIdx + 1}" }
+                        )
+                    }
+                }
+
+                val added = libraryRepository.toggleBookmark(
+                    bookId = book.id,
+                    pageIndex = pageIdx,
+                    totalPages = state.totalPages,
+                    epubChapterIndex = chapterIdx,
+                    epubCharOffset = charOffset,
+                    chapterTitle = chapterTitle,
+                    snippet = snippet
                 )
-            )
+                _effects.emit(
+                    ReaderEffect.ShowSnackbar(
+                        if (added) "Bookmark saved for page ${pageIdx + 1}" else "Bookmark removed"
+                    )
+                )
+            }
         }
     }
 
@@ -801,6 +827,14 @@ class ReaderViewModel(
 
     fun setPdfInvertInDark(invert: Boolean) {
         viewModelScope.launch { preferencesRepository.updatePdfInvertInDark(invert) }
+    }
+
+    fun setPdfFitMode(mode: PdfFitMode) {
+        viewModelScope.launch { preferencesRepository.updatePdfFitMode(mode) }
+    }
+
+    fun setPdfTrimMargins(trim: Boolean) {
+        viewModelScope.launch { preferencesRepository.updatePdfTrimMargins(trim) }
     }
 
     // --- EPUB On-Demand Image Loading (O(1) via Central Directory archive) ---

@@ -131,10 +131,18 @@ enum class ReaderFontFamily(val label: String) {
     MONO("Mono")
 }
 
+enum class PdfFitMode(val label: String) {
+    FIT_SCREEN("Full Screen"),
+    FIT_WIDTH("Fit Content"),
+    FIT_PAGE("Original")
+}
+
 data class ReaderSettings(
     val theme: ReaderTheme = ReaderTheme.PAPER,
     val fontSizeSp: Float = 18f,
     val lineHeightMultiplier: Float = 1.5f,
     val fontFamily: ReaderFontFamily = ReaderFontFamily.SERIF,
-    val pdfInvertInDark: Boolean = false
+    val pdfInvertInDark: Boolean = false,
+    val pdfFitMode: PdfFitMode = PdfFitMode.FIT_SCREEN,
+    val pdfTrimMargins: Boolean = true
 )

@@ -156,7 +156,7 @@ fun EpubPagerView(
                 modifier = Modifier
                     .fillMaxSize()
                     .onGloballyPositioned { pageBoxCoords = it }
-                    .pointerInput(pageIndex) {
+                    .pointerInput(pageIndex, page) {
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
                             val downPos = down.position
@@ -672,7 +672,9 @@ private fun resolveChapterOffsetAtPosition(
     var bestLocalOffset = Offset.Zero
 
     for (target in validTargets) {
-        val local = target.coords.localPositionOf(pageBoxCoords, touchInPageBox)
+        val local = runCatching {
+            target.coords.localPositionOf(pageBoxCoords, touchInPageBox)
+        }.getOrNull() ?: continue
         val w = target.coords.size.width.toFloat()
         val h = target.coords.size.height.toFloat()
         val dy = when {

@@ -119,8 +119,8 @@ object PdfSearchEngine {
         val results = ArrayList<SearchMatch>()
         val snippetRadius = 45
 
-        context.contentResolver.openInputStream(controller.uri)?.use { stream ->
-            PDDocument.load(stream).use { doc ->
+        controller.withPdfBoxDocument { doc ->
+            run {
                 val totalPages = doc.numberOfPages
                 for (pageIndex in 0 until totalPages) {
                     currentCoroutineContext().ensureActive()

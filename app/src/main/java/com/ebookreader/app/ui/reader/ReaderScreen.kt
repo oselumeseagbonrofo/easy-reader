@@ -6,6 +6,7 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -40,6 +41,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -47,7 +49,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -57,9 +61,14 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.ebookreader.app.domain.model.BookFormat
+import com.ebookreader.app.domain.model.PdfFitMode
 import com.ebookreader.app.ui.theme.ReaderPalette
 import com.ebookreader.app.ui.theme.readerPaletteFor
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 
 @Composable
 fun ReaderScreen(
@@ -73,59 +82,6 @@ fun ReaderScreen(
     var isHudVisible by remember { mutableStateOf(false) }
     var activeSheet by remember { mutableStateOf<ReaderModalSheet?>(null) }
     var tocSheetInitialTab by remember { mutableIntStateOf(0) }
-
-    val pagerState = rememberPagerState(
-        initialPage = uiState.currentPage.coerceAtLeast(0),
-        pageCount = { uiState.totalPages.coerceAtLeast(1) }
-    )
-
-    // Flush reading progress whenever app goes to background or ReaderScreen leaves composition
-    val lifecycleOwner = LocalLifecycleOwner.current
-    DisposableEffect(lifecycleOwner) {
-        val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) {
-                viewModel.flushProgressImmediately()
-            }
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        onDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            viewModel.flushProgressImmediately()
-        }
-    }
-
-    // Observe user page swipes and update ViewModel progress without restarting on background chapter merge
-    LaunchedEffect(pagerState, uiState.isPaginating) {
-        if (uiState.isPaginating) return@LaunchedEffect
-        snapshotFlow { pagerState.settledPage }
-            .distinctUntilChanged()
-            .collect { settled ->
-                viewModel.onPageSettled(settled)
-            }
-    }
-
-    // Handle programmatic scroll commands (scrubber, TOC, bookmarks, search matches, lazy chapter merge)
-    LaunchedEffect(viewModel, pagerState) {
-        viewModel.effects.collect { effect ->
-            when (effect) {
-                is ReaderEffect.ScrollToPage -> {
-                    val maxPage = (pagerState.pageCount - 1).coerceAtLeast(0)
-                    val target = effect.pageIndex.coerceIn(0, maxPage)
-                    if (pagerState.currentPage != target) {
-                        if (effect.animate) {
-                            pagerState.animateScrollToPage(target)
-                        } else {
-                            pagerState.scrollToPage(target)
-                        }
-                    }
-                    viewModel.onScrollEffectApplied(target)
-                }
-                is ReaderEffect.ShowSnackbar -> {
-                    snackbarHostState.showSnackbar(effect.message)
-                }
-            }
-        }
-    }
 
     val pdfBookmarkedPages = remember(uiState.bookmarks) {
         uiState.bookmarks.filter { !it.isTextSelection }.map { it.pageIndex }.toSet()
@@ -175,64 +131,160 @@ fun ReaderScreen(
             }
 
             else -> {
-                Column(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .statusBarsPadding()
-                ) {
-                    // Main reading area (strictly page-by-page HorizontalPager)
-                    BoxWithConstraints(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .weight(1f)
-                    ) {
-                        val density = LocalDensity.current
-                        val textMeasurer = rememberTextMeasurer()
+                key(uiState.book?.id) {
+                    val pagerState = rememberPagerState(
+                        initialPage = uiState.currentPage.coerceIn(
+                            0,
+                            (uiState.totalPages - 1).coerceAtLeast(0)
+                        ),
+                        pageCount = { uiState.totalPages.coerceAtLeast(1) }
+                    )
 
-                        val contentWidthPx = with(density) { (maxWidth - 44.dp).roundToPx() }
-                        val contentHeightPx = with(density) { (maxHeight - 24.dp).roundToPx() }
+                    var showInitialPdfFitPill by remember {
+                        mutableStateOf(uiState.book?.format == BookFormat.PDF)
+                    }
+                    LaunchedEffect(showInitialPdfFitPill, uiState.settings.pdfFitMode, uiState.settings.pdfTrimMargins) {
+                        if (showInitialPdfFitPill) {
+                            delay(4_000)
+                            showInitialPdfFitPill = false
+                        }
+                    }
 
-                        if (uiState.book?.format == BookFormat.EPUB && uiState.epubBook != null) {
-                            LaunchedEffect(
-                                uiState.epubBook,
-                                contentWidthPx,
-                                contentHeightPx,
-                                uiState.settings.fontSizeSp,
-                                uiState.settings.lineHeightMultiplier,
-                                uiState.settings.fontFamily
-                            ) {
-                                viewModel.onEpubViewportReady(
-                                    widthPx = contentWidthPx,
-                                    heightPx = contentHeightPx,
-                                    density = density,
-                                    textMeasurer = textMeasurer
-                                )
+                    val lifecycleOwner = LocalLifecycleOwner.current
+                    DisposableEffect(lifecycleOwner, pagerState) {
+                        val observer = LifecycleEventObserver { _, event ->
+                            if (event == Lifecycle.Event.ON_STOP) {
+                                viewModel.syncCurrentPageBeforeExit(pagerState.targetPage)
+                                viewModel.flushProgressImmediately()
                             }
+                        }
+                        lifecycleOwner.lifecycle.addObserver(observer)
+                        onDispose {
+                            lifecycleOwner.lifecycle.removeObserver(observer)
+                            viewModel.syncCurrentPageBeforeExit(pagerState.targetPage)
+                            viewModel.flushProgressImmediately()
+                        }
+                    }
 
-                            val paginated = uiState.paginatedEpub
-                            if (paginated == null || uiState.isPaginating) {
-                                Box(
-                                    contentAlignment = Alignment.Center,
-                                    modifier = Modifier.fillMaxSize()
-                                ) {
-                                    CircularProgressIndicator(color = palette.accent)
+                    LaunchedEffect(pagerState, uiState.isPaginating) {
+                        if (uiState.isPaginating) return@LaunchedEffect
+                        snapshotFlow { pagerState.settledPage }
+                            .distinctUntilChanged()
+                            .collect { settled ->
+                                viewModel.onPageSettled(settled)
+                            }
+                    }
+
+                    LaunchedEffect(viewModel, pagerState) {
+                        var snackbarJob: Job? = null
+                        viewModel.effects.collect { effect ->
+                            when (effect) {
+                                is ReaderEffect.ScrollToPage -> {
+                                    val expectedTotal = viewModel.uiState.value.totalPages.coerceAtLeast(1)
+                                    val desired = effect.pageIndex.coerceIn(0, expectedTotal - 1)
+                                    if (pagerState.pageCount <= desired) {
+                                        snapshotFlow { pagerState.pageCount }
+                                            .first { it > desired || it >= expectedTotal }
+                                    }
+                                    val maxPage = (pagerState.pageCount - 1).coerceAtLeast(0)
+                                    val target = desired.coerceIn(0, maxPage)
+                                    if (pagerState.currentPage != target) {
+                                        if (effect.animate) {
+                                            pagerState.animateScrollToPage(target)
+                                        } else {
+                                            pagerState.scrollToPage(target)
+                                        }
+                                    }
+                                    viewModel.onScrollEffectApplied(target)
                                 }
-                            } else {
-                                EpubPagerView(
-                                    epubBook = uiState.epubBook!!,
-                                    pages = paginated.pages,
+
+                                is ReaderEffect.ShowSnackbar -> {
+                                    snackbarJob?.cancel()
+                                    snackbarJob = launch {
+                                        snackbarHostState.currentSnackbarData?.dismiss()
+                                        snackbarHostState.showSnackbar(effect.message)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .statusBarsPadding()
+                    ) {
+                        BoxWithConstraints(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .weight(1f)
+                        ) {
+                            val density = LocalDensity.current
+                            val textMeasurer = rememberTextMeasurer()
+
+                            val contentWidthPx = with(density) { (maxWidth - 44.dp).roundToPx() }
+                            val contentHeightPx = with(density) { (maxHeight - 24.dp).roundToPx() }
+
+                            if (uiState.book?.format == BookFormat.EPUB && uiState.epubBook != null) {
+                                LaunchedEffect(
+                                    uiState.epubBook,
+                                    contentWidthPx,
+                                    contentHeightPx,
+                                    uiState.settings.fontSizeSp,
+                                    uiState.settings.lineHeightMultiplier,
+                                    uiState.settings.fontFamily
+                                ) {
+                                    viewModel.onEpubViewportReady(
+                                        widthPx = contentWidthPx,
+                                        heightPx = contentHeightPx,
+                                        density = density,
+                                        textMeasurer = textMeasurer
+                                    )
+                                }
+
+                                val paginated = uiState.paginatedEpub
+                                if (paginated == null || uiState.isPaginating) {
+                                    Box(
+                                        contentAlignment = Alignment.Center,
+                                        modifier = Modifier.fillMaxSize()
+                                    ) {
+                                        CircularProgressIndicator(color = palette.accent)
+                                    }
+                                } else {
+                                    EpubPagerView(
+                                        epubBook = uiState.epubBook!!,
+                                        pages = paginated.pages,
+                                        pagerState = pagerState,
+                                        settings = uiState.settings,
+                                        palette = palette,
+                                        bookmarks = uiState.bookmarks,
+                                        highlights = uiState.highlights,
+                                        searchMatches = uiState.searchMatches,
+                                        activeMatchIndex = uiState.activeMatchIndex,
+                                        loadImage = viewModel::loadEpubImage,
+                                        onApplyHighlight = viewModel::applyHighlight,
+                                        onClearHighlight = viewModel::clearHighlightRange,
+                                        onBookmarkSelection = viewModel::toggleSelectionBookmark,
+                                        onToggleHud = {
+                                            if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
+                                                viewModel.setSearchResultsExpanded(false)
+                                            } else {
+                                                isHudVisible = !isHudVisible
+                                            }
+                                        }
+                                    )
+                                }
+                            } else if (uiState.book?.format == BookFormat.PDF && uiState.pdfController != null) {
+                                PdfPagerView(
+                                    controller = uiState.pdfController!!,
                                     pagerState = pagerState,
                                     settings = uiState.settings,
                                     palette = palette,
-                                    bookmarks = uiState.bookmarks,
-                                    highlights = uiState.highlights,
+                                    bookmarkedPages = pdfBookmarkedPages,
                                     searchMatches = uiState.searchMatches,
                                     activeMatchIndex = uiState.activeMatchIndex,
-                                    loadImage = viewModel::loadEpubImage,
-                                    onApplyHighlight = viewModel::applyHighlight,
-                                    onClearHighlight = viewModel::clearHighlightRange,
-                                    onBookmarkSelection = viewModel::toggleSelectionBookmark,
                                     onToggleHud = {
+                                        showInitialPdfFitPill = false
                                         if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
                                             viewModel.setSearchResultsExpanded(false)
                                         } else {
@@ -241,63 +293,64 @@ fun ReaderScreen(
                                     }
                                 )
                             }
-                        } else if (uiState.book?.format == BookFormat.PDF && uiState.pdfController != null) {
-                            PdfPagerView(
-                                controller = uiState.pdfController!!,
-                                pagerState = pagerState,
-                                settings = uiState.settings,
-                                palette = palette,
-                                bookmarkedPages = pdfBookmarkedPages,
-                                searchMatches = uiState.searchMatches,
-                                activeMatchIndex = uiState.activeMatchIndex,
-                                onToggleHud = {
-                                    if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
-                                        viewModel.setSearchResultsExpanded(false)
-                                    } else {
-                                        isHudVisible = !isHudVisible
-                                    }
-                                }
-                            )
                         }
+
+                        AmbientReadingProgressStrip(
+                            currentPage = uiState.currentPage,
+                            totalPages = uiState.totalPages,
+                            progress = uiState.progress,
+                            chapterTitle = uiState.currentChapterTitle,
+                            palette = palette
+                        )
                     }
 
-                    // Always-visible subtle ambient bottom progress strip
-                    AmbientReadingProgressStrip(
-                        currentPage = uiState.currentPage,
-                        totalPages = uiState.totalPages,
-                        progress = uiState.progress,
+                    if (uiState.book?.format == BookFormat.PDF) {
+                        PdfFitQuickPill(
+                            visible = (showInitialPdfFitPill || isHudVisible) && !uiState.isSearchVisible,
+                            currentMode = uiState.settings.pdfFitMode,
+                            trimMargins = uiState.settings.pdfTrimMargins,
+                            palette = palette,
+                            onSelectMode = { mode ->
+                                showInitialPdfFitPill = true
+                                viewModel.setPdfFitMode(mode)
+                            },
+                            onToggleTrim = {
+                                showInitialPdfFitPill = true
+                                viewModel.setPdfTrimMargins(!uiState.settings.pdfTrimMargins)
+                            },
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(bottom = if (isHudVisible) 138.dp else 44.dp)
+                        )
+                    }
+
+                    ReaderTopHudBar(
+                        visible = isHudVisible && !uiState.isSearchVisible,
+                        bookTitle = uiState.book?.title.orEmpty(),
                         chapterTitle = uiState.currentChapterTitle,
-                        palette = palette
+                        isBookmarked = uiState.isCurrentPageBookmarked,
+                        palette = palette,
+                        onBack = {
+                            viewModel.syncCurrentPageBeforeExit(pagerState.targetPage)
+                            viewModel.flushProgressImmediately()
+                            onNavigateBack()
+                        },
+                        onOpenSearch = {
+                            isHudVisible = false
+                            viewModel.openSearch()
+                        },
+                        onToggleBookmark = viewModel::toggleBookmarkAtCurrentPage,
+                        onOpenTocAndBookmarks = {
+                            tocSheetInitialTab = 0
+                            activeSheet = ReaderModalSheet.TOC_BOOKMARKS
+                        },
+                        onOpenSettings = {
+                            activeSheet = ReaderModalSheet.SETTINGS
+                        },
+                        modifier = Modifier.align(Alignment.TopCenter)
                     )
                 }
 
-                // Top HUD Bar (shown when center-tapped and search is not active)
-                ReaderTopHudBar(
-                    visible = isHudVisible && !uiState.isSearchVisible,
-                    bookTitle = uiState.book?.title.orEmpty(),
-                    chapterTitle = uiState.currentChapterTitle,
-                    isBookmarked = uiState.isCurrentPageBookmarked,
-                    palette = palette,
-                    onBack = {
-                        viewModel.flushProgressImmediately()
-                        onNavigateBack()
-                    },
-                    onOpenSearch = {
-                        isHudVisible = false
-                        viewModel.openSearch()
-                    },
-                    onToggleBookmark = viewModel::toggleBookmarkAtCurrentPage,
-                    onOpenTocAndBookmarks = {
-                        tocSheetInitialTab = 0
-                        activeSheet = ReaderModalSheet.TOC_BOOKMARKS
-                    },
-                    onOpenSettings = {
-                        activeSheet = ReaderModalSheet.SETTINGS
-                    },
-                    modifier = Modifier.align(Alignment.TopCenter)
-                )
-
-                // In-Book Search Overlay
                 AnimatedVisibility(
                     visible = uiState.isSearchVisible,
                     enter = fadeIn() + slideInVertically(initialOffsetY = { -it / 2 }),
@@ -319,7 +372,6 @@ fun ReaderScreen(
                     )
                 }
 
-                // Bottom Interactive Scrubber HUD
                 InteractiveProgressScrubberHud(
                     visible = isHudVisible,
                     currentPage = uiState.currentPage,
@@ -351,7 +403,7 @@ fun ReaderScreen(
             hostState = snackbarHostState,
             modifier = Modifier
                 .align(Alignment.BottomCenter)
-                .padding(bottom = if (isHudVisible) 136.dp else 28.dp)
+                .padding(bottom = if (isHudVisible) 184.dp else 84.dp)
         )
     }
 
@@ -386,6 +438,8 @@ fun ReaderScreen(
                 onSelectFontFamily = viewModel::setFontFamily,
                 onFontSizeChange = viewModel::setFontSize,
                 onLineHeightChange = viewModel::setLineHeight,
+                onPdfFitModeChange = viewModel::setPdfFitMode,
+                onPdfTrimMarginsChange = viewModel::setPdfTrimMargins,
                 onPdfInvertChange = viewModel::setPdfInvertInDark,
                 onDismiss = { activeSheet = null }
             )
@@ -398,6 +452,68 @@ fun ReaderScreen(
 private enum class ReaderModalSheet {
     TOC_BOOKMARKS,
     SETTINGS
+}
+
+@Composable
+private fun PdfFitQuickPill(
+    visible: Boolean,
+    currentMode: PdfFitMode,
+    trimMargins: Boolean,
+    palette: ReaderPalette,
+    onSelectMode: (PdfFitMode) -> Unit,
+    onToggleTrim: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn() + slideInVertically(initialOffsetY = { it / 2 }),
+        exit = fadeOut() + slideOutVertically(targetOffsetY = { it / 2 }),
+        modifier = modifier
+    ) {
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = palette.hudContainer.copy(alpha = 0.94f),
+            contentColor = palette.onHudContainer,
+            tonalElevation = 6.dp,
+            shadowElevation = 6.dp
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp)
+            ) {
+                PdfFitMode.entries.forEach { mode ->
+                    val selected = currentMode == mode
+                    Text(
+                        text = mode.label,
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                        color = if (selected) palette.hudContainer else palette.onHudContainer,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(
+                                if (selected) palette.accent else palette.onHudContainer.copy(alpha = 0.08f)
+                            )
+                            .clickable { onSelectMode(mode) }
+                            .padding(horizontal = 10.dp, vertical = 5.dp)
+                    )
+                }
+                if (currentMode != PdfFitMode.FIT_PAGE) {
+                    Text(
+                        text = if (trimMargins) "Crop ✓" else "Crop",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = if (trimMargins) FontWeight.SemiBold else FontWeight.Normal,
+                        color = if (trimMargins) palette.accent else palette.onHudContainer.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(palette.onHudContainer.copy(alpha = 0.08f))
+                            .clickable { onToggleTrim() }
+                            .padding(horizontal = 9.dp, vertical = 5.dp)
+                    )
+                }
+            }
+        }
+    }
 }
 
 @Composable

@@ -24,10 +24,13 @@ import com.ebookreader.app.domain.model.Bookmark
 import com.ebookreader.app.domain.model.HighlightColor
 import com.ebookreader.app.domain.model.ReadingProgressCalculator
 import com.ebookreader.app.domain.model.TextHighlight
+import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
@@ -41,6 +44,7 @@ class LibraryRepository(
     private val bookmarkDao: BookmarkDao,
     private val highlightDao: HighlightDao
 ) {
+    private val annotationMutex = Mutex()
 
     fun observeBooks(): Flow<List<Book>> = bookDao.observeAllBooks().map { entities ->
         entities.map { entity ->
@@ -184,27 +188,29 @@ class LibraryRepository(
         chapterTitle: String,
         snippet: String
     ): Boolean = withContext(Dispatchers.IO) {
-        val existing = bookmarkDao.getBookmarksForBook(bookId).firstOrNull { bm ->
-            bm.pageIndex == pageIndex && bm.epubEndCharOffset <= bm.epubCharOffset
-        }
-        if (existing != null) {
-            bookmarkDao.deleteBookmarkById(existing.id)
-            false
-        } else {
-            val progress = ReadingProgressCalculator.computeProgress(pageIndex, totalPages)
-            bookmarkDao.insertBookmark(
-                BookmarkEntity(
-                    bookId = bookId,
-                    pageIndex = pageIndex,
-                    epubChapterIndex = epubChapterIndex,
-                    epubCharOffset = epubCharOffset,
-                    epubEndCharOffset = epubCharOffset,
-                    progress = progress,
-                    chapterTitle = chapterTitle,
-                    snippet = snippet.ifBlank { "Page ${pageIndex + 1}" }
+        annotationMutex.withLock {
+            val existing = bookmarkDao.getBookmarksForBook(bookId).firstOrNull { bm ->
+                bm.pageIndex == pageIndex && bm.epubEndCharOffset <= bm.epubCharOffset
+            }
+            if (existing != null) {
+                bookmarkDao.deleteBookmarkById(existing.id)
+                false
+            } else {
+                val progress = ReadingProgressCalculator.computeProgress(pageIndex, totalPages)
+                bookmarkDao.insertBookmark(
+                    BookmarkEntity(
+                        bookId = bookId,
+                        pageIndex = pageIndex,
+                        epubChapterIndex = epubChapterIndex,
+                        epubCharOffset = epubCharOffset,
+                        epubEndCharOffset = epubCharOffset,
+                        progress = progress,
+                        chapterTitle = chapterTitle,
+                        snippet = snippet.ifBlank { "Page ${pageIndex + 1}" }
+                    )
                 )
-            )
-            true
+                true
+            }
         }
     }
 
@@ -218,36 +224,40 @@ class LibraryRepository(
         chapterTitle: String,
         selectedText: String
     ): Boolean = withContext(Dispatchers.IO) {
-        val safeEnd = maxOf(startCharOffset + 1, endCharOffset)
-        val existing = bookmarkDao.getBookmarksForBook(bookId).firstOrNull { bm ->
-            bm.epubChapterIndex == chapterIndex &&
-                bm.epubEndCharOffset > bm.epubCharOffset &&
-                bm.epubCharOffset == startCharOffset &&
-                bm.epubEndCharOffset == safeEnd
-        }
-        if (existing != null) {
-            bookmarkDao.deleteBookmarkById(existing.id)
-            false
-        } else {
-            val progress = ReadingProgressCalculator.computeProgress(pageIndex, totalPages)
-            bookmarkDao.insertBookmark(
-                BookmarkEntity(
-                    bookId = bookId,
-                    pageIndex = pageIndex,
-                    epubChapterIndex = chapterIndex,
-                    epubCharOffset = startCharOffset,
-                    epubEndCharOffset = safeEnd,
-                    progress = progress,
-                    chapterTitle = chapterTitle,
-                    snippet = selectedText.trim().take(600)
+        annotationMutex.withLock {
+            val safeEnd = maxOf(startCharOffset + 1, endCharOffset)
+            val existing = bookmarkDao.getBookmarksForBook(bookId).firstOrNull { bm ->
+                bm.epubChapterIndex == chapterIndex &&
+                    bm.epubEndCharOffset > bm.epubCharOffset &&
+                    bm.epubCharOffset == startCharOffset &&
+                    bm.epubEndCharOffset == safeEnd
+            }
+            if (existing != null) {
+                bookmarkDao.deleteBookmarkById(existing.id)
+                false
+            } else {
+                val progress = ReadingProgressCalculator.computeProgress(pageIndex, totalPages)
+                bookmarkDao.insertBookmark(
+                    BookmarkEntity(
+                        bookId = bookId,
+                        pageIndex = pageIndex,
+                        epubChapterIndex = chapterIndex,
+                        epubCharOffset = startCharOffset,
+                        epubEndCharOffset = safeEnd,
+                        progress = progress,
+                        chapterTitle = chapterTitle,
+                        snippet = selectedText.trim().take(600)
+                    )
                 )
-            )
-            true
+                true
+            }
         }
     }
 
     suspend fun deleteBookmark(bookmarkId: Long) = withContext(Dispatchers.IO) {
-        bookmarkDao.deleteBookmarkById(bookmarkId)
+        annotationMutex.withLock {
+            bookmarkDao.deleteBookmarkById(bookmarkId)
+        }
     }
 
     suspend fun saveHighlight(
@@ -261,24 +271,26 @@ class LibraryRepository(
         color: HighlightColor
     ) = withContext(Dispatchers.IO) {
         if (endCharOffset <= startCharOffset) return@withContext
-        highlightDao.deleteOverlappingHighlights(
-            bookId = bookId,
-            chapterIndex = chapterIndex,
-            startOffset = startCharOffset,
-            endOffset = endCharOffset
-        )
-        highlightDao.insertHighlight(
-            HighlightEntity(
+        annotationMutex.withLock {
+            highlightDao.deleteOverlappingHighlights(
                 bookId = bookId,
-                pageIndex = pageIndex,
                 chapterIndex = chapterIndex,
-                startCharOffset = startCharOffset,
-                endCharOffset = endCharOffset,
-                chapterTitle = chapterTitle,
-                selectedText = selectedText.trim().take(600),
-                colorName = color.name
+                startOffset = startCharOffset,
+                endOffset = endCharOffset
             )
-        )
+            highlightDao.insertHighlight(
+                HighlightEntity(
+                    bookId = bookId,
+                    pageIndex = pageIndex,
+                    chapterIndex = chapterIndex,
+                    startCharOffset = startCharOffset,
+                    endCharOffset = endCharOffset,
+                    chapterTitle = chapterTitle,
+                    selectedText = selectedText.trim().take(600),
+                    colorName = color.name
+                )
+            )
+        }
     }
 
     suspend fun clearHighlightsInRange(
@@ -287,16 +299,20 @@ class LibraryRepository(
         startCharOffset: Int,
         endCharOffset: Int
     ) = withContext(Dispatchers.IO) {
-        highlightDao.deleteOverlappingHighlights(
-            bookId = bookId,
-            chapterIndex = chapterIndex,
-            startOffset = startCharOffset,
-            endOffset = endCharOffset
-        )
+        annotationMutex.withLock {
+            highlightDao.deleteOverlappingHighlights(
+                bookId = bookId,
+                chapterIndex = chapterIndex,
+                startOffset = startCharOffset,
+                endOffset = endCharOffset
+            )
+        }
     }
 
     suspend fun deleteHighlight(highlightId: Long) = withContext(Dispatchers.IO) {
-        highlightDao.deleteHighlightById(highlightId)
+        annotationMutex.withLock {
+            highlightDao.deleteHighlightById(highlightId)
+        }
     }
 
     fun isUriAccessible(uriString: String): Boolean {
@@ -429,7 +445,7 @@ class LibraryRepository(
         var author = "PDF Document"
         runCatching {
             context.contentResolver.openInputStream(uri)?.use { stream ->
-                PDDocument.load(stream).use { doc ->
+                PDDocument.load(stream, MemoryUsageSetting.setupTempFileOnly()).use { doc ->
                     val info = doc.documentInformation
                     info?.title?.trim()?.takeIf { it.isNotBlank() }?.let { title = it }
                     info?.author?.trim()?.takeIf { it.isNotBlank() }?.let { author = it }

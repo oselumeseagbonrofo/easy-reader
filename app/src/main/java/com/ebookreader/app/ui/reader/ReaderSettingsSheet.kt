@@ -26,6 +26,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.ebookreader.app.domain.model.BookFormat
+import com.ebookreader.app.domain.model.PdfFitMode
 import com.ebookreader.app.domain.model.ReaderFontFamily
 import com.ebookreader.app.domain.model.ReaderSettings
 import com.ebookreader.app.domain.model.ReaderTheme
@@ -41,6 +42,8 @@ fun ReaderSettingsSheet(
     onSelectFontFamily: (ReaderFontFamily) -> Unit,
     onFontSizeChange: (Float) -> Unit,
     onLineHeightChange: (Float) -> Unit,
+    onPdfFitModeChange: (PdfFitMode) -> Unit,
+    onPdfTrimMarginsChange: (Boolean) -> Unit,
     onPdfInvertChange: (Boolean) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -175,6 +178,52 @@ fun ReaderSettingsSheet(
                     steps = 6
                 )
             } else {
+                Text(
+                    text = "PDF Screen Fit",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    PdfFitMode.entries.forEach { mode ->
+                        FilterChip(
+                            selected = settings.pdfFitMode == mode,
+                            onClick = { onPdfFitModeChange(mode) },
+                            label = { Text(mode.label, maxLines = 1) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+
+                Spacer(Modifier.height(10.dp))
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Trim PDF Whitespace Margins",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Text(
+                            text = "Crops outer blank page borders so text fills the phone screen.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = settings.pdfTrimMargins,
+                        onCheckedChange = onPdfTrimMarginsChange
+                    )
+                }
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween,

@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import com.ebookreader.app.data.parser.pdf.PdfDocumentController
+import com.ebookreader.app.domain.model.PdfFitMode
 import com.ebookreader.app.domain.model.ReaderSettings
 import com.ebookreader.app.domain.model.SearchMatch
 import com.ebookreader.app.ui.theme.ReaderPalette
@@ -64,7 +65,9 @@ private data class RenderedZoomTile(
     val bitmap: Bitmap,
     val scale: Float,
     val offsetX: Float,
-    val offsetY: Float
+    val offsetY: Float,
+    val fitMode: PdfFitMode,
+    val trimMargins: Boolean
 )
 
 @Composable
@@ -105,6 +108,8 @@ fun PdfPagerView(
             pageIndex = pageIndex,
             totalPages = controller.pageCount,
             isActivePage = (pageIndex == pagerState.currentPage),
+            fitMode = settings.pdfFitMode,
+            trimMargins = settings.pdfTrimMargins,
             invertColors = settings.pdfInvertInDark && palette.isDark,
             isBookmarked = pageIndex in bookmarkedPages,
             pageMatches = pageMatches,
@@ -144,6 +149,8 @@ private fun PdfSinglePageSurface(
     pageIndex: Int,
     totalPages: Int,
     isActivePage: Boolean,
+    fitMode: PdfFitMode,
+    trimMargins: Boolean,
     invertColors: Boolean,
     isBookmarked: Boolean,
     pageMatches: List<SearchMatch>,
@@ -171,27 +178,40 @@ private fun PdfSinglePageSurface(
         onDispose { clearZoomTile() }
     }
 
-    LaunchedEffect(isActivePage) {
-        if (!isActivePage && scale != 1f) {
-            scale = 1f
-            offsetX = 0f
-            offsetY = 0f
-            clearZoomTile()
+    LaunchedEffect(isActivePage, fitMode, trimMargins) {
+        if ((!isActivePage && scale != 1f) || scale != 1f) {
+            if (!isActivePage) {
+                scale = 1f
+                offsetX = 0f
+                offsetY = 0f
+                clearZoomTile()
+            }
         }
+        offsetY = 0f
+    }
+
+    val paddingMod = if (fitMode == PdfFitMode.FIT_PAGE) {
+        Modifier.padding(horizontal = 6.dp, vertical = 8.dp)
+    } else {
+        Modifier
     }
 
     BoxWithConstraints(
         contentAlignment = Alignment.Center,
         modifier = Modifier
             .fillMaxSize()
-            .padding(horizontal = 6.dp, vertical = 8.dp)
+            .then(paddingMod)
             .clipToBounds()
     ) {
         val viewportWidthPx = with(density) { maxWidth.roundToPx() }.coerceAtLeast(360)
         val viewportHeightPx = with(density) { maxHeight.roundToPx() }.coerceAtLeast(480)
-        var pageBitmap by remember(pageIndex) { mutableStateOf<Bitmap?>(null) }
+        var pageBitmap by remember(controller, pageIndex, viewportWidthPx) {
+            mutableStateOf(controller.getCachedPage(pageIndex, viewportWidthPx))
+        }
 
-        LaunchedEffect(controller, pageIndex, viewportWidthPx) {
+        LaunchedEffect(controller, pageIndex, viewportWidthPx, isActivePage) {
+            if (pageBitmap != null && !pageBitmap!!.isRecycled) return@LaunchedEffect
+            if (!isActivePage) delay(35)
             val rendered = controller.renderPage(
                 pageIndex = pageIndex,
                 targetWidthPx = viewportWidthPx,
@@ -202,22 +222,31 @@ private fun PdfSinglePageSurface(
             }
         }
 
-        // Viewport Tile Zoom: only rasterize the visible screen rectangle when zoomed in (>1.25x)
-        val baseBmp = pageBitmap
-        LaunchedEffect(controller, pageIndex, isActivePage, baseBmp, scale, offsetX, offsetY, viewportWidthPx, viewportHeightPx) {
+        val baseBmp = pageBitmap?.takeIf { !it.isRecycled }
+        val contentBounds = remember(baseBmp, pageIndex) {
+            if (baseBmp != null) controller.getContentBounds(pageIndex)
+            else com.ebookreader.app.data.parser.pdf.PdfContentBounds.FULL
+        }
+
+        LaunchedEffect(
+            controller, pageIndex, isActivePage, baseBmp,
+            scale, offsetX, offsetY, fitMode, trimMargins, viewportWidthPx, viewportHeightPx
+        ) {
             if (!isActivePage || baseBmp == null || scale <= 1.25f) {
                 clearZoomTile()
                 return@LaunchedEffect
             }
             delay(110)
 
-            val bmpW = baseBmp.width.toFloat().coerceAtLeast(1f)
-            val bmpH = baseBmp.height.toFloat().coerceAtLeast(1f)
-            val fitScale = minOf(viewportWidthPx / bmpW, viewportHeightPx / bmpH)
-            val fitW = bmpW * fitScale
-            val fitH = bmpH * fitScale
-            val fitLeft = (viewportWidthPx - fitW) / 2f
-            val fitTop = (viewportHeightPx - fitH) / 2f
+            val rect = PdfDocumentController.computePdfDisplayRect(
+                viewportWidth = viewportWidthPx.toFloat(),
+                viewportHeight = viewportHeightPx.toFloat(),
+                bitmapWidth = baseBmp.width.toFloat(),
+                bitmapHeight = baseBmp.height.toFloat(),
+                contentBounds = contentBounds,
+                fitMode = fitMode,
+                trimMargins = trimMargins
+            )
 
             val targetScale = scale
             val targetOx = offsetX
@@ -227,10 +256,10 @@ private fun PdfSinglePageSurface(
                 pageIndex = pageIndex,
                 viewportWidthPx = viewportWidthPx,
                 viewportHeightPx = viewportHeightPx,
-                fitLeft = fitLeft,
-                fitTop = fitTop,
-                fitWidth = fitW,
-                fitHeight = fitH,
+                fitLeft = rect.pageLeft,
+                fitTop = rect.pageTop,
+                fitWidth = rect.pageWidth,
+                fitHeight = rect.pageHeight,
                 zoomScale = targetScale,
                 panOffsetX = targetOx,
                 panOffsetY = targetOy
@@ -242,7 +271,9 @@ private fun PdfSinglePageSurface(
                     bitmap = renderedTile,
                     scale = targetScale,
                     offsetX = targetOx,
-                    offsetY = targetOy
+                    offsetY = targetOy,
+                    fitMode = fitMode,
+                    trimMargins = trimMargins
                 )
                 if (previous != null && previous.bitmap !== renderedTile && !previous.bitmap.isRecycled) {
                     previous.bitmap.recycle()
@@ -256,7 +287,7 @@ private fun PdfSinglePageSurface(
                 .fillMaxSize()
                 .pointerInput(pageIndex, totalPages) {
                     detectTapGestures(
-                        onDoubleTap = {
+                        onDoubleTap = { tapOffset ->
                             if (scale > 1.05f) {
                                 scale = 1f
                                 offsetX = 0f
@@ -264,7 +295,14 @@ private fun PdfSinglePageSurface(
                                 clearZoomTile()
                                 onZoomStateChanged(false)
                             } else {
-                                scale = 2.4f
+                                val targetScale = 2.2f
+                                val maxX = (size.width * (targetScale - 1f)) / 2f
+                                val maxY = (size.height * (targetScale - 1f)) / 2f
+                                val centerX = size.width / 2f
+                                val centerY = size.height / 2f
+                                scale = targetScale
+                                offsetX = ((centerX - tapOffset.x) * (targetScale - 1f)).coerceIn(-maxX, maxX)
+                                offsetY = ((centerY - tapOffset.y) * (targetScale - 1f)).coerceIn(-maxY, maxY)
                                 onZoomStateChanged(true)
                             }
                         },
@@ -283,7 +321,7 @@ private fun PdfSinglePageSurface(
                         }
                     )
                 }
-                .pointerInput(pageIndex) {
+                .pointerInput(pageIndex, fitMode, trimMargins, baseBmp) {
                     awaitEachGesture {
                         awaitFirstDown(requireUnconsumed = false)
                         do {
@@ -309,20 +347,36 @@ private fun PdfSinglePageSurface(
                                     clearZoomTile()
                                     onZoomStateChanged(false)
                                 }
+                            } else if (fitMode == PdfFitMode.FIT_WIDTH && baseBmp != null) {
+                                val rect = PdfDocumentController.computePdfDisplayRect(
+                                    viewportWidth = size.width.toFloat(),
+                                    viewportHeight = size.height.toFloat(),
+                                    bitmapWidth = baseBmp.width.toFloat(),
+                                    bitmapHeight = baseBmp.height.toFloat(),
+                                    contentBounds = contentBounds,
+                                    fitMode = fitMode,
+                                    trimMargins = trimMargins
+                                )
+                                val overflowY = (rect.contentDisplayHeight - size.height).coerceAtLeast(0f)
+                                if (overflowY > 4f) {
+                                    val pan = event.calculatePan()
+                                    if (abs(pan.y) > abs(pan.x) * 1.15f && abs(pan.y) > 1f) {
+                                        offsetY = (offsetY + pan.y).coerceIn(-overflowY, 0f)
+                                        event.changes.forEach { it.consume() }
+                                    }
+                                }
                             }
                         } while (event.changes.any { it.pressed })
                     }
                 }
         ) {
-            val bmp = pageBitmap
-            if (bmp == null) {
+            if (baseBmp == null) {
                 CircularProgressIndicator(color = palette.accent)
             } else {
                 val colorFilter = remember(invertColors) {
                     if (invertColors) ColorFilter.colorMatrix(NIGHT_INVERT_MATRIX) else null
                 }
 
-                // Layer 1: Instant 1x backdrop + search highlights inside scaled graphicsLayer
                 Canvas(
                     modifier = Modifier
                         .fillMaxSize()
@@ -333,18 +387,23 @@ private fun PdfSinglePageSurface(
                             translationY = offsetY
                         }
                 ) {
-                    val bmpW = bmp.width.toFloat().coerceAtLeast(1f)
-                    val bmpH = bmp.height.toFloat().coerceAtLeast(1f)
-                    val fitScale = minOf(size.width / bmpW, size.height / bmpH)
-                    val drawW = bmpW * fitScale
-                    val drawH = bmpH * fitScale
-                    val left = (size.width - drawW) / 2f
-                    val top = (size.height - drawH) / 2f
+                    val rect = PdfDocumentController.computePdfDisplayRect(
+                        viewportWidth = size.width,
+                        viewportHeight = size.height,
+                        bitmapWidth = baseBmp.width.toFloat(),
+                        bitmapHeight = baseBmp.height.toFloat(),
+                        contentBounds = contentBounds,
+                        fitMode = fitMode,
+                        trimMargins = trimMargins
+                    )
 
                     drawImage(
-                        image = bmp.asImageBitmap(),
-                        dstOffset = IntOffset(left.roundToInt(), top.roundToInt()),
-                        dstSize = IntSize(drawW.roundToInt(), drawH.roundToInt()),
+                        image = baseBmp.asImageBitmap(),
+                        dstOffset = IntOffset(rect.pageLeft.roundToInt(), rect.pageTop.roundToInt()),
+                        dstSize = IntSize(
+                            rect.pageWidth.roundToInt().coerceAtLeast(1),
+                            rect.pageHeight.roundToInt().coerceAtLeast(1)
+                        ),
                         colorFilter = colorFilter
                     )
 
@@ -352,17 +411,18 @@ private fun PdfSinglePageSurface(
                         pageMatches = pageMatches,
                         activeMatch = activeMatch,
                         palette = palette,
-                        left = left,
-                        top = top,
-                        drawW = drawW,
-                        drawH = drawH
+                        left = rect.pageLeft,
+                        top = rect.pageTop,
+                        drawW = rect.pageWidth,
+                        drawH = rect.pageHeight
                     )
                 }
 
-                // Layer 2: High-DPI Viewport Tile overlay (screen-sized constant memory!)
                 val activeTile = zoomTile
                 if (activeTile != null &&
                     !activeTile.bitmap.isRecycled &&
+                    activeTile.fitMode == fitMode &&
+                    activeTile.trimMargins == trimMargins &&
                     abs(activeTile.scale - scale) < 0.015f &&
                     abs(activeTile.offsetX - offsetX) < 2f &&
                     abs(activeTile.offsetY - offsetY) < 2f
@@ -376,13 +436,15 @@ private fun PdfSinglePageSurface(
                         )
 
                         if (pageMatches.isNotEmpty()) {
-                            val bmpW = bmp.width.toFloat().coerceAtLeast(1f)
-                            val bmpH = bmp.height.toFloat().coerceAtLeast(1f)
-                            val fitScale = minOf(size.width / bmpW, size.height / bmpH)
-                            val fitW = bmpW * fitScale
-                            val fitH = bmpH * fitScale
-                            val fitLeft = (size.width - fitW) / 2f
-                            val fitTop = (size.height - fitH) / 2f
+                            val rect = PdfDocumentController.computePdfDisplayRect(
+                                viewportWidth = size.width,
+                                viewportHeight = size.height,
+                                bitmapWidth = baseBmp.width.toFloat(),
+                                bitmapHeight = baseBmp.height.toFloat(),
+                                contentBounds = contentBounds,
+                                fitMode = fitMode,
+                                trimMargins = trimMargins
+                            )
                             val px = size.width / 2f
                             val py = size.height / 2f
 
@@ -390,10 +452,10 @@ private fun PdfSinglePageSurface(
                                 pageMatches = pageMatches,
                                 activeMatch = activeMatch,
                                 palette = palette,
-                                left = px + (fitLeft - px) * scale + offsetX,
-                                top = py + (fitTop - py) * scale + offsetY,
-                                drawW = fitW * scale,
-                                drawH = fitH * scale
+                                left = px + (rect.pageLeft - px) * scale + offsetX,
+                                top = py + (rect.pageTop - py) * scale + offsetY,
+                                drawW = rect.pageWidth * scale,
+                                drawH = rect.pageHeight * scale
                             )
                         }
                     }
