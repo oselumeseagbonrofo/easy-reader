@@ -11,21 +11,28 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
@@ -39,8 +46,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -122,6 +132,12 @@ fun InteractiveProgressScrubberHud(
 ) {
     var isDragging by remember { mutableStateOf(false) }
     var dragPageFloat by remember { mutableFloatStateOf(currentPage.toFloat()) }
+    var isEditingPage by remember { mutableStateOf(false) }
+    var pageInputText by remember { mutableStateOf("") }
+
+    LaunchedEffect(visible) {
+        if (!visible) isEditingPage = false
+    }
 
     LaunchedEffect(currentPage, isDragging) {
         if (!isDragging) {
@@ -152,6 +168,7 @@ fun InteractiveProgressScrubberHud(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
+                .imePadding()
                 .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
             if (returnPageBeforeJump != null) {
@@ -195,23 +212,86 @@ fun InteractiveProgressScrubberHud(
                         Text(
                             text = previewTitle.ifBlank { "Page ${previewPage + 1}" },
                             style = MaterialTheme.typography.labelMedium,
-                            color = palette.onHudContainer.copy(alpha = 0.8f),
+                            color = if (palette.isDark) palette.onHudContainer.copy(alpha = 0.8f) else Color.Black,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f)
                         )
                         Spacer(Modifier.width(12.dp))
                         Surface(
+                            onClick = {
+                                pageInputText = (currentPage + 1).toString()
+                                isEditingPage = !isEditingPage
+                            },
                             shape = RoundedCornerShape(8.dp),
                             color = palette.accent.copy(alpha = 0.16f)
                         ) {
                             Text(
-                                text = "Page ${previewPage + 1} of $totalPages · $previewPercent%",
+                                text = "Page ${previewPage + 1} of $totalPages · $previewPercent% ✎",
                                 style = MaterialTheme.typography.labelMedium,
                                 fontWeight = FontWeight.Bold,
                                 color = palette.accent,
                                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
                             )
+                        }
+                    }
+
+                    AnimatedVisibility(visible = isEditingPage) {
+                        val parsedTarget = ReadingProgressCalculator.parseTargetPage(pageInputText, totalPages)
+                        val pageInputTextColor = if (palette.isDark) palette.onHudContainer else Color.Black
+                        val commitJump = {
+                            if (parsedTarget != null) {
+                                isEditingPage = false
+                                if (parsedTarget != currentPage) {
+                                    onJumpToPage(parsedTarget)
+                                }
+                            }
+                        }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp, bottom = 4.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = pageInputText,
+                                onValueChange = { value ->
+                                    pageInputText = value.filter { it.isDigit() }
+                                },
+                                label = {
+                                    Text(
+                                        text = "Go to page (1–$totalPages)",
+                                        color = pageInputTextColor
+                                    )
+                                },
+                                singleLine = true,
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedTextColor = pageInputTextColor,
+                                    unfocusedTextColor = pageInputTextColor,
+                                    focusedLabelColor = pageInputTextColor,
+                                    unfocusedLabelColor = pageInputTextColor,
+                                    cursorColor = pageInputTextColor,
+                                    focusedBorderColor = palette.accent,
+                                    unfocusedBorderColor = pageInputTextColor.copy(alpha = 0.5f)
+                                ),
+                                keyboardOptions = KeyboardOptions(
+                                    keyboardType = KeyboardType.Number,
+                                    imeAction = ImeAction.Go
+                                ),
+                                keyboardActions = KeyboardActions(onGo = { commitJump() }),
+                                modifier = Modifier.weight(1f)
+                            )
+                            Button(
+                                onClick = commitJump,
+                                enabled = parsedTarget != null,
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = palette.accent,
+                                    contentColor = if (palette.isDark) Color.Black else Color.White
+                                )
+                            ) {
+                                Text("Go")
+                            }
                         }
                     }
 

@@ -7,6 +7,7 @@ import com.ebookreader.app.domain.model.BookFormat
 import com.ebookreader.app.domain.model.ReadingProgressCalculator
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -75,5 +76,17 @@ class ProgressCalculationTest {
         assertEquals(0, paginated.findPageForAnchor(chapterIndex = 0, charOffset = 120))
         assertEquals(1, paginated.findPageForAnchor(chapterIndex = 0, charOffset = 500))
         assertEquals(3, paginated.findPageForAnchor(chapterIndex = 1, charOffset = 650))
+    }
+
+    @Test
+    fun `parseTargetPage converts 1-based user page input into 0-based index and rejects out-of-bounds`() {
+        assertEquals(0, ReadingProgressCalculator.parseTargetPage("1", 120))
+        assertEquals(41, ReadingProgressCalculator.parseTargetPage(" 42 ", 120))
+        assertEquals(119, ReadingProgressCalculator.parseTargetPage("120", 120))
+        assertNull(ReadingProgressCalculator.parseTargetPage("0", 120))
+        assertNull(ReadingProgressCalculator.parseTargetPage("121", 120))
+        assertNull(ReadingProgressCalculator.parseTargetPage("-5", 120))
+        assertNull(ReadingProgressCalculator.parseTargetPage("abc", 120))
+        assertNull(ReadingProgressCalculator.parseTargetPage("1", 0))
     }
 }
