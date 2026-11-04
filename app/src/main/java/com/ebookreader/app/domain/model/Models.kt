@@ -46,6 +46,12 @@ object ReadingProgressCalculator {
         val clamped = progress.coerceIn(0f, 1f)
         return ((clamped * (totalPages - 1)).roundToInt()).coerceIn(0, totalPages - 1)
     }
+
+    fun parseTargetPage(input: String, totalPages: Int): Int? {
+        if (totalPages <= 0) return null
+        val pageNumber = input.trim().toIntOrNull() ?: return null
+        return if (pageNumber in 1..totalPages) pageNumber - 1 else null
+    }
 }
 
 data class Bookmark(
