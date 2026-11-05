@@ -78,10 +78,6 @@ fun ReaderScreen(
     var activeSheet by remember { mutableStateOf<ReaderModalSheet?>(null) }
     var tocSheetInitialTab by remember { mutableIntStateOf(0) }
 
-    val pdfBookmarkedPages = remember(uiState.bookmarks) {
-        uiState.bookmarks.filter { !it.isTextSelection }.map { it.pageIndex }.toSet()
-    }
-
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -265,9 +261,13 @@ fun ReaderScreen(
                                     pagerState = pagerState,
                                     settings = uiState.settings,
                                     palette = palette,
-                                    bookmarkedPages = pdfBookmarkedPages,
+                                    bookmarks = uiState.bookmarks,
+                                    highlights = uiState.highlights,
                                     searchMatches = uiState.searchMatches,
                                     activeMatchIndex = uiState.activeMatchIndex,
+                                    onApplyHighlight = viewModel::applyHighlight,
+                                    onClearHighlight = viewModel::clearHighlightRange,
+                                    onBookmarkSelection = viewModel::toggleSelectionBookmark,
                                     onToggleHud = {
                                         if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
                                             viewModel.setSearchResultsExpanded(false)

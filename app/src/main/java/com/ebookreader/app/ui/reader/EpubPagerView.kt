@@ -200,8 +200,8 @@ fun EpubPagerView(
                                                     targets = sliceTargets.values
                                                 )
                                                 if (dragHit != null) {
-                                                    val range = expandRangeToWordBoundaries(
-                                                        chapterText = ch.plainText,
+                                                    val range = EpubSelectionHelper.expandRangeToWordBoundaries(
+                                                        plainText = ch.plainText,
                                                         offsetA = selectionAnchorOffset,
                                                         offsetB = dragHit
                                                     )
@@ -413,12 +413,35 @@ fun EpubPagerView(
                     }
 
                     SelectionFloatingBar(
-                        selection = currentSelectionOnPage,
-                        chapter = chapter,
                         palette = palette,
                         hasOverlappingHighlight = hasOverlappingHighlight,
                         isSelectionBookmarked = isExactSelectionBookmarked,
-                        onUpdateSelection = { activeSelection = it },
+                        onExpandSentence = {
+                            val (s, e) = EpubSelectionHelper.expandToSentence(
+                                chapter.plainText,
+                                currentSelectionOnPage.startCharOffset
+                            )
+                            if (e > s) {
+                                activeSelection = currentSelectionOnPage.copy(
+                                    startCharOffset = s,
+                                    endCharOffset = e,
+                                    selectedText = chapter.plainText.substring(s, e)
+                                )
+                            }
+                        },
+                        onExpandParagraph = {
+                            val (s, e) = EpubSelectionHelper.expandToParagraph(
+                                chapter,
+                                currentSelectionOnPage.startCharOffset
+                            )
+                            if (e > s) {
+                                activeSelection = currentSelectionOnPage.copy(
+                                    startCharOffset = s,
+                                    endCharOffset = e,
+                                    selectedText = chapter.plainText.substring(s, e)
+                                )
+                            }
+                        },
                         onPickHighlightColor = { color ->
                             onApplyHighlight(
                                 currentSelectionOnPage.chapterIndex,
@@ -458,13 +481,12 @@ fun EpubPagerView(
 }
 
 @Composable
-private fun SelectionFloatingBar(
-    selection: ChapterTextSelection,
-    chapter: EpubChapter,
+internal fun SelectionFloatingBar(
     palette: ReaderPalette,
     hasOverlappingHighlight: Boolean,
     isSelectionBookmarked: Boolean,
-    onUpdateSelection: (ChapterTextSelection) -> Unit,
+    onExpandSentence: () -> Unit,
+    onExpandParagraph: () -> Unit,
     onPickHighlightColor: (HighlightColor) -> Unit,
     onClearHighlight: () -> Unit,
     onBookmarkSelection: () -> Unit,
@@ -477,7 +499,12 @@ private fun SelectionFloatingBar(
         contentColor = palette.onHudContainer,
         tonalElevation = 8.dp,
         shadowElevation = 10.dp,
-        modifier = modifier
+        modifier = modifier.pointerInput(Unit) {
+            awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false)
+                down.consume()
+            }
+        }
     ) {
         Column(
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
@@ -490,40 +517,12 @@ private fun SelectionFloatingBar(
                 ExpandScopeChip(
                     label = "Sentence",
                     palette = palette,
-                    onClick = {
-                        val (s, e) = EpubSelectionHelper.expandToSentence(
-                            chapter.plainText,
-                            selection.startCharOffset
-                        )
-                        if (e > s) {
-                            onUpdateSelection(
-                                selection.copy(
-                                    startCharOffset = s,
-                                    endCharOffset = e,
-                                    selectedText = chapter.plainText.substring(s, e)
-                                )
-                            )
-                        }
-                    }
+                    onClick = onExpandSentence
                 )
                 ExpandScopeChip(
                     label = "Paragraph",
                     palette = palette,
-                    onClick = {
-                        val (s, e) = EpubSelectionHelper.expandToParagraph(
-                            chapter,
-                            selection.startCharOffset
-                        )
-                        if (e > s) {
-                            onUpdateSelection(
-                                selection.copy(
-                                    startCharOffset = s,
-                                    endCharOffset = e,
-                                    selectedText = chapter.plainText.substring(s, e)
-                                )
-                            )
-                        }
-                    }
+                    onClick = onExpandParagraph
                 )
 
                 Spacer(Modifier.weight(1f))
@@ -703,26 +702,6 @@ private fun resolveChapterOffsetAtPosition(
     val localCharIdx = chosen.layoutResult.getOffsetForPosition(bestLocalOffset)
         .coerceIn(0, chosen.slice.text.length)
     return chosen.slice.chapterCharStart + localCharIdx
-}
-
-private fun expandRangeToWordBoundaries(
-    chapterText: String,
-    offsetA: Int,
-    offsetB: Int
-): Pair<Int, Int> {
-    if (chapterText.isEmpty()) return 0 to 0
-    var start = minOf(offsetA, offsetB).coerceIn(0, chapterText.lastIndex)
-    var end = maxOf(offsetA, offsetB).coerceIn(0, chapterText.length)
-
-    while (start > 0 && !chapterText[start - 1].isWhitespace()) {
-        start--
-    }
-    while (end < chapterText.length && !chapterText[end].isWhitespace()) {
-        end++
-    }
-    while (start < end && chapterText[start].isWhitespace()) start++
-    while (end > start && chapterText[end - 1].isWhitespace()) end--
-    return start to end
 }
 
 private fun buildDecoratedSliceText(

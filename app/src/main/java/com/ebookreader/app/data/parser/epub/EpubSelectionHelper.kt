@@ -84,12 +84,45 @@ object EpubSelectionHelper {
         }
 
         // Fallback to newline boundaries
+        return expandToParagraph(text, pos)
+    }
+
+    /**
+     * Expands a character offset inside [plainText] to the surrounding newline-delimited
+     * paragraph `[start, endExclusive)`.
+     */
+    fun expandToParagraph(plainText: String, charOffset: Int): Pair<Int, Int> {
+        if (plainText.isEmpty()) return 0 to 0
+        val pos = charOffset.coerceIn(0, plainText.lastIndex)
         var start = pos
-        while (start > 0 && text[start - 1] != '\n') start--
+        while (start > 0 && plainText[start - 1] != '\n') start--
         var end = pos
-        while (end < text.length && text[end] != '\n') end++
-        while (start < end && text[start].isWhitespace()) start++
-        while (end > start && text[end - 1].isWhitespace()) end--
+        while (end < plainText.length && plainText[end] != '\n') end++
+        while (start < end && plainText[start].isWhitespace()) start++
+        while (end > start && plainText[end - 1].isWhitespace()) end--
+        return start to end
+    }
+
+    /**
+     * Expands two character offsets `[offsetA, offsetB]` to surrounding word boundaries.
+     */
+    fun expandRangeToWordBoundaries(
+        plainText: String,
+        offsetA: Int,
+        offsetB: Int
+    ): Pair<Int, Int> {
+        if (plainText.isEmpty()) return 0 to 0
+        var start = minOf(offsetA, offsetB).coerceIn(0, plainText.lastIndex)
+        var end = maxOf(offsetA, offsetB).coerceIn(0, plainText.length)
+
+        while (start > 0 && !plainText[start - 1].isWhitespace()) {
+            start--
+        }
+        while (end < plainText.length && !plainText[end].isWhitespace()) {
+            end++
+        }
+        while (start < end && plainText[start].isWhitespace()) start++
+        while (end > start && plainText[end - 1].isWhitespace()) end--
         return start to end
     }
 }

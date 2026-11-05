@@ -260,4 +260,126 @@ class PdfAndAnnotationFixesTest {
         // FIT_SCREEN fills >96% of the phone screen on first load (~97.6%)
         assertTrue("Expected FIT_SCREEN coverage > 0.96, got $screenCov", screenCov > 0.96f)
     }
+
+    @Test
+    fun `PDF page text layout hit tests touch coordinates and resolves multi-line highlight rects`() {
+        val p1Line1 = "Quantum computing accelerates molecular simulation."
+        val p1Line2 = "Second sentence wraps across two visual lines cleanly."
+        val p2 = "Final paragraph starts after a vertical break."
+        val fullText = "$p1Line1 $p1Line2\n$p2"
+
+        val bounds = ArrayList<com.ebookreader.app.domain.model.NormalizedRect?>(fullText.length)
+        for (i in fullText.indices) {
+            val ch = fullText[i]
+            if (ch == '\n' || ch == ' ') {
+                bounds.add(null)
+            } else if (i < p1Line1.length) {
+                val col = i.toFloat() / p1Line1.length
+                bounds.add(
+                    com.ebookreader.app.domain.model.NormalizedRect(
+                        left = 0.10f + col * 0.75f,
+                        top = 0.15f,
+                        right = 0.10f + (col + 0.018f) * 0.75f,
+                        bottom = 0.175f
+                    )
+                )
+            } else if (i <= p1Line1.length + 1 + p1Line2.length) {
+                val localIdx = i - (p1Line1.length + 1)
+                val secondLineHalf = p1Line2.length / 2
+                val isWrappedLine = localIdx >= secondLineHalf
+                val col = if (!isWrappedLine) {
+                    localIdx.toFloat() / secondLineHalf
+                } else {
+                    (localIdx - secondLineHalf).toFloat() / (p1Line2.length - secondLineHalf)
+                }
+                val top = if (!isWrappedLine) 0.19f else 0.23f
+                bounds.add(
+                    com.ebookreader.app.domain.model.NormalizedRect(
+                        left = 0.10f + col * 0.75f,
+                        top = top,
+                        right = 0.10f + (col + 0.03f) * 0.75f,
+                        bottom = top + 0.025f
+                    )
+                )
+            } else {
+                val localIdx = i - (p1Line1.length + 1 + p1Line2.length + 1)
+                val col = localIdx.toFloat() / p2.length
+                bounds.add(
+                    com.ebookreader.app.domain.model.NormalizedRect(
+                        left = 0.10f + col * 0.70f,
+                        top = 0.32f,
+                        right = 0.10f + (col + 0.02f) * 0.70f,
+                        bottom = 0.345f
+                    )
+                )
+            }
+        }
+
+        val layout = com.ebookreader.app.data.parser.pdf.PdfPageTextLayout(
+            pageIndex = 0,
+            plainText = fullText,
+            charBounds = bounds
+        )
+
+        // Hit-test near the middle of the wrapped second sentence on line 2 (top=0.19..0.215)
+        val hitOffset = layout.hitTestCharOffset(normX = 0.32f, normY = 0.20f)
+        org.junit.Assert.assertNotNull("Expected long-press on PDF text line to hit a character", hitOffset)
+        val (sentStart, sentEnd) = com.ebookreader.app.data.parser.epub.EpubSelectionHelper.expandToSentence(
+            layout.plainText,
+            hitOffset!!
+        )
+        assertEquals(p1Line2, layout.plainText.substring(sentStart, sentEnd))
+
+        // Paragraph expansion from same hit selects the entire 2-sentence first paragraph
+        val (paraStart, paraEnd) = com.ebookreader.app.data.parser.epub.EpubSelectionHelper.expandToParagraph(
+            layout.plainText,
+            hitOffset
+        )
+        assertEquals("$p1Line1 $p1Line2", layout.plainText.substring(paraStart, paraEnd))
+
+        // Word-boundary drag selection across sentence 1 and sentence 2
+        val (wordStart, wordEnd) = com.ebookreader.app.data.parser.epub.EpubSelectionHelper.expandRangeToWordBoundaries(
+            layout.plainText,
+            fullText.indexOf("molecular"),
+            fullText.indexOf("wraps") + 2
+        )
+        assertEquals(
+            "molecular simulation. Second sentence wraps",
+            layout.plainText.substring(wordStart, wordEnd)
+        )
+
+        // Multi-line sentence should merge into 2 line highlight rectangles
+        val highlightRects = layout.rectsForRange(sentStart, sentEnd)
+        assertEquals(2, highlightRects.size)
+
+        // Full paragraph (line 1 + wrapped sentence across lines 2 & 3) merges into 3 line rectangles
+        val paraRects = layout.rectsForRange(paraStart, paraEnd)
+        assertEquals(3, paraRects.size)
+
+        // Loose drag hit-testing outside direct line bounds resolves to nearest character seamlessly
+        val looseDragHit = layout.hitTestCharOffset(normX = 0.92f, normY = 0.38f, allowLooseDrag = true)
+        org.junit.Assert.assertNotNull("Expected loose drag hit-test to resolve nearest character", looseDragHit)
+        assertEquals(fullText.length - 1, looseDragHit)
+    }
+
+    @Test
+    fun `purgeStalePdfBoxTempFiles removes leaked PDFBox tmp files without touching covers`() {
+        val tempRoot = java.nio.file.Files.createTempDirectory("easy_reader_cache_test").toFile()
+        try {
+            val stale1 = java.io.File(tempRoot, "PDFBox2980990577159650174.tmp").apply { writeBytes(ByteArray(128)) }
+            val stale2 = java.io.File(tempRoot, "PDFBox7577516149433317059.tmp").apply { writeBytes(ByteArray(256)) }
+            val dbLock = java.io.File(tempRoot, "easy_reader.db.lck").apply { writeText("lock") }
+            val coversDir = java.io.File(tempRoot, "covers").apply { mkdirs() }
+            val coverFile = java.io.File(coversDir, "book1.webp").apply { writeText("webp") }
+
+            PdfDocumentController.purgeStalePdfBoxTempFiles(tempRoot)
+
+            org.junit.Assert.assertFalse("Expected PDFBox tmp #1 to be purged", stale1.exists())
+            org.junit.Assert.assertFalse("Expected PDFBox tmp #2 to be purged", stale2.exists())
+            assertTrue("Expected db lock file to remain untouched", dbLock.exists())
+            assertTrue("Expected cover thumbnail to remain untouched", coverFile.exists())
+        } finally {
+            tempRoot.deleteRecursively()
+        }
+    }
 }

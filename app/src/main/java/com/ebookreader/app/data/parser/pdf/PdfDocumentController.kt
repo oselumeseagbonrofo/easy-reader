@@ -13,6 +13,9 @@ import android.util.LruCache
 import com.ebookreader.app.domain.model.PdfFitMode
 import com.ebookreader.app.domain.model.TocEntry
 import com.tom_roush.pdfbox.io.MemoryUsageSetting
+import com.tom_roush.pdfbox.io.RandomAccessRead
+import com.tom_roush.pdfbox.io.ScratchFile
+import com.tom_roush.pdfbox.pdfparser.PDFParser
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineNode
@@ -22,8 +25,12 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.Closeable
+import java.io.File
+import java.io.FileInputStream
 import java.io.FileNotFoundException
 import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.channels.FileChannel
 import kotlin.math.roundToInt
 
 data class PdfTileTransform(
@@ -74,6 +81,7 @@ class PdfDocumentController private constructor(
 
     @Volatile
     private var isClosed = false
+    private var pdfBoxRandomAccess: Closeable? = null
     private var pdfBoxStream: InputStream? = null
     private var cachedPdDocument: PDDocument? = null
 
@@ -90,6 +98,41 @@ class PdfDocumentController private constructor(
 
     private val boundsCache = LruCache<Int, PdfContentBounds>(256)
     private val snippetCache = LruCache<Int, String>(128)
+    private val textLayoutCache = LruCache<Int, PdfPageTextLayout>(64)
+
+    fun getCachedPageTextLayout(pageIndex: Int): PdfPageTextLayout? =
+        synchronized(textLayoutCache) { textLayoutCache.get(pageIndex) }
+
+    suspend fun extractPageTextLayout(pageIndex: Int): PdfPageTextLayout = withContext(Dispatchers.IO) {
+        synchronized(textLayoutCache) { textLayoutCache.get(pageIndex) }
+            ?.takeIf { it.hasText }
+            ?.let { return@withContext it }
+
+        val nativeLayout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            runCatching {
+                withPage(pageIndex) { page ->
+                    PdfSearchEngine.extractPageTextLayoutNativeApi35(page, pageIndex)
+                }
+            }.getOrNull()
+        } else {
+            null
+        }
+
+        val extracted = if (nativeLayout != null && nativeLayout.hasText) {
+            nativeLayout
+        } else {
+            withPdfBoxDocument { doc ->
+                PdfSearchEngine.extractPageTextLayout(doc, pageIndex)
+            } ?: PdfPageTextLayout(pageIndex, "", emptyList())
+        }
+
+        if (extracted.hasText) {
+            synchronized(textLayoutCache) {
+                textLayoutCache.put(pageIndex, extracted)
+            }
+        }
+        extracted
+    }
 
     private fun cacheKeyFor(pageIndex: Int, targetWidthPx: Int, highResMultiplier: Float): String {
         val requestedWidth = (targetWidthPx.coerceAtLeast(360) * highResMultiplier)
@@ -132,11 +175,21 @@ class PdfDocumentController private constructor(
         withContext(Dispatchers.IO) {
             pdfBoxMutex.withLock {
                 if (isClosed) return@withLock null
+                runCatching {
+                    if (!com.tom_roush.pdfbox.android.PDFBoxResourceLoader.isReady()) {
+                        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context.applicationContext)
+                    }
+                }
                 val doc = cachedPdDocument ?: runCatching {
-                    val stream = context.contentResolver.openInputStream(uri) ?: return@runCatching null
-                    PDDocument.load(stream, MemoryUsageSetting.setupTempFileOnly()).also { loaded ->
-                        pdfBoxStream = stream
+                    openZeroCopyPdDocument(context, uri)?.also { (loaded, source) ->
+                        pdfBoxRandomAccess = source
                         cachedPdDocument = loaded
+                    }?.first ?: run {
+                        val stream = context.contentResolver.openInputStream(uri) ?: return@runCatching null
+                        PDDocument.load(stream, MemoryUsageSetting.setupTempFileOnly()).also { loaded ->
+                            pdfBoxStream = stream
+                            cachedPdDocument = loaded
+                        }
                     }
                 }.getOrNull() ?: return@withLock null
                 runCatching { block(doc) }.getOrNull()
@@ -255,6 +308,14 @@ class PdfDocumentController private constructor(
         withPdfBoxDocument { doc ->
             val root = doc.documentCatalog?.documentOutline ?: return@withPdfBoxDocument emptyList()
             val entries = ArrayList<TocEntry>()
+            val pageToIndex = HashMap<com.tom_roush.pdfbox.cos.COSBase, Int>()
+            runCatching {
+                var idx = 0
+                for (page in doc.pages) {
+                    pageToIndex[page.cosObject] = idx
+                    idx++
+                }
+            }
 
             fun walkOutline(node: PDOutlineNode, depth: Int) {
                 var current: PDOutlineItem? = node.firstChild
@@ -262,7 +323,8 @@ class PdfDocumentController private constructor(
                     val title = current.title?.trim().orEmpty()
                     val destPage = runCatching { current.findDestinationPage(doc) }.getOrNull()
                     val pageIdx = if (destPage != null) {
-                        doc.pages.indexOf(destPage).coerceAtLeast(0)
+                        pageToIndex[destPage.cosObject]
+                            ?: runCatching { doc.pages.indexOf(destPage) }.getOrDefault(0).coerceAtLeast(0)
                     } else {
                         0
                     }
@@ -324,16 +386,59 @@ class PdfDocumentController private constructor(
         synchronized(bitmapCache) { bitmapCache.evictAll() }
         synchronized(boundsCache) { boundsCache.evictAll() }
         synchronized(snippetCache) { snippetCache.evictAll() }
+        synchronized(textLayoutCache) { textLayoutCache.evictAll() }
         runCatching { cachedPdDocument?.close() }
         cachedPdDocument = null
+        runCatching { pdfBoxRandomAccess?.close() }
+        pdfBoxRandomAccess = null
         runCatching { pdfBoxStream?.close() }
         pdfBoxStream = null
         runCatching { pdfRenderer.close() }
         runCatching { parcelFileDescriptor.close() }
+        purgeStalePdfBoxTempFiles(context.cacheDir)
     }
 
     companion object {
         private const val MAX_TILE_DIMENSION_PX = 1440
+
+        fun purgeStalePdfBoxTempFiles(cacheDir: File?) {
+            runCatching {
+                cacheDir?.listFiles()?.forEach { f ->
+                    if (f.isFile && f.name.startsWith("PDFBox") && f.name.endsWith(".tmp")) {
+                        runCatching { f.delete() }
+                    }
+                }
+            }
+        }
+
+        fun openZeroCopyPdDocument(
+            context: Context,
+            uri: Uri
+        ): Pair<PDDocument, Closeable>? {
+            val pfd = runCatching { context.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
+                ?: return null
+            val fis = runCatching { FileInputStream(pfd.fileDescriptor) }.getOrNull() ?: run {
+                runCatching { pfd.close() }
+                return null
+            }
+            val channel = fis.channel
+            val size = runCatching { channel.size() }.getOrDefault(-1L)
+            if (size <= 0L) {
+                runCatching { fis.close() }
+                runCatching { pfd.close() }
+                return null
+            }
+            val reader = FileChannelRandomAccessRead(pfd, fis, channel, size)
+            return try {
+                val scratch = ScratchFile(MemoryUsageSetting.setupTempFileOnly())
+                val parser = PDFParser(reader, scratch)
+                parser.parse()
+                parser.pdDocument to reader
+            } catch (t: Throwable) {
+                runCatching { reader.close() }
+                null
+            }
+        }
 
         fun detectContentBounds(bitmap: Bitmap): PdfContentBounds {
             val w = bitmap.width
@@ -499,6 +604,7 @@ class PdfDocumentController private constructor(
         }
 
         fun open(context: Context, uri: Uri): PdfDocumentController {
+            purgeStalePdfBoxTempFiles(context.cacheDir)
             val pfd = context.contentResolver.openFileDescriptor(uri, "r")
                 ?: throw FileNotFoundException("Unable to open PDF URI: $uri")
             return try {
@@ -509,5 +615,82 @@ class PdfDocumentController private constructor(
                 throw t
             }
         }
+    }
+}
+
+private class FileChannelRandomAccessRead(
+    private val pfd: ParcelFileDescriptor,
+    private val fis: FileInputStream,
+    private val channel: FileChannel,
+    private val fileLength: Long
+) : RandomAccessRead {
+    private var position: Long = 0L
+    private var closed: Boolean = false
+    private val singleByteBuf = ByteBuffer.allocate(1)
+
+    override fun read(): Int {
+        if (closed || position >= fileLength) return -1
+        singleByteBuf.clear()
+        val read = channel.read(singleByteBuf, position)
+        if (read <= 0) return -1
+        position += 1
+        return singleByteBuf.get(0).toInt() and 0xFF
+    }
+
+    override fun read(b: ByteArray): Int = read(b, 0, b.size)
+
+    override fun read(b: ByteArray, offset: Int, length: Int): Int {
+        if (closed || position >= fileLength) return -1
+        if (length == 0) return 0
+        val toRead = minOf(length.toLong(), fileLength - position).toInt()
+        val buf = ByteBuffer.wrap(b, offset, toRead)
+        val n = channel.read(buf, position)
+        if (n <= 0) return -1
+        position += n
+        return n
+    }
+
+    override fun getPosition(): Long = position
+
+    override fun seek(newPosition: Long) {
+        position = newPosition.coerceIn(0L, fileLength)
+    }
+
+    override fun length(): Long = fileLength
+
+    override fun isClosed(): Boolean = closed
+
+    override fun peek(): Int {
+        val result = read()
+        if (result != -1) {
+            position -= 1
+        }
+        return result
+    }
+
+    override fun rewind(bytes: Int) {
+        position = (position - bytes).coerceAtLeast(0L)
+    }
+
+    override fun readFully(length: Int): ByteArray {
+        val bytes = ByteArray(length)
+        var total = 0
+        while (total < length) {
+            val n = read(bytes, total, length - total)
+            if (n <= 0) break
+            total += n
+        }
+        return if (total == length) bytes else bytes.copyOf(total)
+    }
+
+    override fun isEOF(): Boolean = position >= fileLength
+
+    override fun available(): Int = (fileLength - position).coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+
+    override fun close() {
+        closed = true
+        runCatching { channel.close() }
+        runCatching { fis.close() }
+        runCatching { pfd.close() }
     }
 }

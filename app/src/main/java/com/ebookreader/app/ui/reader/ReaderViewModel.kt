@@ -627,10 +627,18 @@ class ReaderViewModel(
         if (selectedText.isBlank() || endCharOffset <= startCharOffset) return
 
         viewModelScope.launch {
-            val pageIdx = state.paginatedEpub?.findPageForAnchor(chapterIndex, startCharOffset)
-                ?: state.currentPage
-            val chapterTitle = state.epubBook?.chapters?.getOrNull(chapterIndex)?.title
-                ?: state.currentChapterTitle.ifBlank { book.title }
+            val pageIdx = if (book.format == BookFormat.EPUB) {
+                state.paginatedEpub?.findPageForAnchor(chapterIndex, startCharOffset)
+                    ?: state.currentPage
+            } else {
+                chapterIndex.coerceIn(0, (state.totalPages - 1).coerceAtLeast(0))
+            }
+            val chapterTitle = if (book.format == BookFormat.EPUB) {
+                state.epubBook?.chapters?.getOrNull(chapterIndex)?.title
+                    ?: state.currentChapterTitle.ifBlank { book.title }
+            } else {
+                resolvePdfSectionTitle(state.tocEntries, pageIdx)
+            }
 
             val added = libraryRepository.toggleSelectionBookmark(
                 bookId = book.id,
@@ -670,10 +678,18 @@ class ReaderViewModel(
         if (selectedText.isBlank() || endCharOffset <= startCharOffset) return
 
         viewModelScope.launch {
-            val pageIdx = state.paginatedEpub?.findPageForAnchor(chapterIndex, startCharOffset)
-                ?: state.currentPage
-            val chapterTitle = state.epubBook?.chapters?.getOrNull(chapterIndex)?.title
-                ?: state.currentChapterTitle.ifBlank { book.title }
+            val pageIdx = if (book.format == BookFormat.EPUB) {
+                state.paginatedEpub?.findPageForAnchor(chapterIndex, startCharOffset)
+                    ?: state.currentPage
+            } else {
+                chapterIndex.coerceIn(0, (state.totalPages - 1).coerceAtLeast(0))
+            }
+            val chapterTitle = if (book.format == BookFormat.EPUB) {
+                state.epubBook?.chapters?.getOrNull(chapterIndex)?.title
+                    ?: state.currentChapterTitle.ifBlank { book.title }
+            } else {
+                resolvePdfSectionTitle(state.tocEntries, pageIdx)
+            }
 
             libraryRepository.saveHighlight(
                 bookId = book.id,

@@ -14,6 +14,7 @@ class EbookReaderApp : Application() {
     override fun onCreate() {
         super.onCreate()
         PDFBoxResourceLoader.init(applicationContext)
+        com.ebookreader.app.data.parser.pdf.PdfDocumentController.purgeStalePdfBoxTempFiles(applicationContext.cacheDir)
         container = AppContainer(applicationContext)
     }
 }

@@ -28,6 +28,7 @@ import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -50,11 +51,11 @@ class LibraryRepository(
         entities.map { entity ->
             entity.toDomain(isFileAccessible = isUriAccessible(entity.fileUri))
         }
-    }
+    }.flowOn(Dispatchers.IO)
 
     fun observeBookById(bookId: String): Flow<Book?> = bookDao.observeBookById(bookId).map { entity ->
         entity?.toDomain(isFileAccessible = isUriAccessible(entity.fileUri))
-    }
+    }.flowOn(Dispatchers.IO)
 
     suspend fun getBookById(bookId: String): Book? = withContext(Dispatchers.IO) {
         val entity = bookDao.getBookById(bookId) ?: return@withContext null
@@ -444,14 +445,28 @@ class LibraryRepository(
         var title = fallbackTitle
         var author = "PDF Document"
         runCatching {
-            context.contentResolver.openInputStream(uri)?.use { stream ->
-                PDDocument.load(stream, MemoryUsageSetting.setupTempFileOnly()).use { doc ->
+            val zeroCopy = com.ebookreader.app.data.parser.pdf.PdfDocumentController.openZeroCopyPdDocument(context, uri)
+            if (zeroCopy != null) {
+                val (doc, source) = zeroCopy
+                try {
                     val info = doc.documentInformation
                     info?.title?.trim()?.takeIf { it.isNotBlank() }?.let { title = it }
                     info?.author?.trim()?.takeIf { it.isNotBlank() }?.let { author = it }
+                } finally {
+                    runCatching { doc.close() }
+                    runCatching { source.close() }
+                }
+            } else {
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    PDDocument.load(stream, MemoryUsageSetting.setupTempFileOnly()).use { doc ->
+                        val info = doc.documentInformation
+                        info?.title?.trim()?.takeIf { it.isNotBlank() }?.let { title = it }
+                        info?.author?.trim()?.takeIf { it.isNotBlank() }?.let { author = it }
+                    }
                 }
             }
         }
+        com.ebookreader.app.data.parser.pdf.PdfDocumentController.purgeStalePdfBoxTempFiles(context.cacheDir)
 
         return BookEntity(
             id = bookId,

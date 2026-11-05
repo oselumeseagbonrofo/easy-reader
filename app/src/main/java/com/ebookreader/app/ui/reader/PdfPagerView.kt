@@ -1,13 +1,15 @@
 package com.ebookreader.app.ui.reader
 
 import android.graphics.Bitmap
+import android.os.SystemClock
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.fillMaxSize
@@ -24,15 +26,18 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.asImageBitmap
@@ -42,10 +47,17 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import com.ebookreader.app.data.parser.epub.ChapterTextSelection
+import com.ebookreader.app.data.parser.epub.EpubSelectionHelper
 import com.ebookreader.app.data.parser.pdf.PdfDocumentController
+import com.ebookreader.app.data.parser.pdf.PdfPageTextLayout
+import com.ebookreader.app.domain.model.Bookmark
+import com.ebookreader.app.domain.model.HighlightColor
+import com.ebookreader.app.domain.model.NormalizedRect
 import com.ebookreader.app.domain.model.PdfFitMode
 import com.ebookreader.app.domain.model.ReaderSettings
 import com.ebookreader.app.domain.model.SearchMatch
+import com.ebookreader.app.domain.model.TextHighlight
 import com.ebookreader.app.ui.theme.ReaderPalette
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -76,23 +88,36 @@ fun PdfPagerView(
     pagerState: PagerState,
     settings: ReaderSettings,
     palette: ReaderPalette,
-    bookmarkedPages: Set<Int>,
+    bookmarks: List<Bookmark>,
+    highlights: List<TextHighlight>,
     searchMatches: List<SearchMatch>,
     activeMatchIndex: Int,
+    onApplyHighlight: (chapterIndex: Int, startOffset: Int, endOffset: Int, selectedText: String, color: HighlightColor) -> Unit,
+    onClearHighlight: (chapterIndex: Int, startOffset: Int, endOffset: Int) -> Unit,
+    onBookmarkSelection: (chapterIndex: Int, startOffset: Int, endOffset: Int, selectedText: String) -> Unit,
     onToggleHud: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val coroutineScope = rememberCoroutineScope()
     var activePageZoomed by remember { mutableStateOf(false) }
+    var activeSelection by remember { mutableStateOf<ChapterTextSelection?>(null) }
+
+    val bookmarkedPages = remember(bookmarks) {
+        bookmarks.filter { !it.isTextSelection }.map { it.pageIndex }.toSet()
+    }
 
     LaunchedEffect(pagerState.settledPage) {
         activePageZoomed = false
     }
 
+    LaunchedEffect(pagerState.currentPage) {
+        activeSelection = null
+    }
+
     HorizontalPager(
         state = pagerState,
         beyondViewportPageCount = 1,
-        userScrollEnabled = !activePageZoomed,
+        userScrollEnabled = !activePageZoomed && activeSelection == null,
         modifier = modifier
             .fillMaxSize()
             .background(palette.background)
@@ -102,6 +127,17 @@ fun PdfPagerView(
         }
         val activeMatch = searchMatches.getOrNull(activeMatchIndex)
             ?.takeIf { it.pageIndex == pageIndex }
+        val pageHighlights = remember(highlights, pageIndex) {
+            highlights.filter { it.pageIndex == pageIndex || it.chapterIndex == pageIndex }
+        }
+        val pageSelectionBookmarks = remember(bookmarks, pageIndex) {
+            bookmarks.filter {
+                it.isTextSelection && (it.pageIndex == pageIndex || it.epubChapterIndex == pageIndex)
+            }
+        }
+        val currentSelectionOnPage = activeSelection?.takeIf {
+            pageIndex == pagerState.currentPage && it.chapterIndex == pageIndex
+        }
 
         PdfSinglePageSurface(
             controller = controller,
@@ -112,9 +148,16 @@ fun PdfPagerView(
             trimMargins = settings.pdfTrimMargins,
             invertColors = settings.pdfInvertInDark && palette.isDark,
             isBookmarked = pageIndex in bookmarkedPages,
+            pageHighlights = pageHighlights,
+            pageSelectionBookmarks = pageSelectionBookmarks,
+            activeSelection = currentSelectionOnPage,
             pageMatches = pageMatches,
             activeMatch = activeMatch,
             palette = palette,
+            onUpdateSelection = { activeSelection = it },
+            onApplyHighlight = onApplyHighlight,
+            onClearHighlight = onClearHighlight,
+            onBookmarkSelection = onBookmarkSelection,
             onZoomStateChanged = { zoomed ->
                 if (pageIndex == pagerState.currentPage) {
                     activePageZoomed = zoomed
@@ -153,19 +196,39 @@ private fun PdfSinglePageSurface(
     trimMargins: Boolean,
     invertColors: Boolean,
     isBookmarked: Boolean,
+    pageHighlights: List<TextHighlight>,
+    pageSelectionBookmarks: List<Bookmark>,
+    activeSelection: ChapterTextSelection?,
     pageMatches: List<SearchMatch>,
     activeMatch: SearchMatch?,
     palette: ReaderPalette,
+    onUpdateSelection: (ChapterTextSelection?) -> Unit,
+    onApplyHighlight: (chapterIndex: Int, startOffset: Int, endOffset: Int, selectedText: String, color: HighlightColor) -> Unit,
+    onClearHighlight: (chapterIndex: Int, startOffset: Int, endOffset: Int) -> Unit,
+    onBookmarkSelection: (chapterIndex: Int, startOffset: Int, endOffset: Int, selectedText: String) -> Unit,
     onZoomStateChanged: (Boolean) -> Unit,
     onTurnPrevious: () -> Unit,
     onTurnNext: () -> Unit,
     onToggleHud: () -> Unit
 ) {
     val density = LocalDensity.current
+    val pageScope = rememberCoroutineScope()
     var scale by remember(pageIndex) { mutableFloatStateOf(1f) }
     var offsetX by remember(pageIndex) { mutableFloatStateOf(0f) }
     var offsetY by remember(pageIndex) { mutableFloatStateOf(0f) }
     var zoomTile by remember(pageIndex) { mutableStateOf<RenderedZoomTile?>(null) }
+    var selectionAnchorOffset by remember(pageIndex) { mutableIntStateOf(0) }
+    var selectionPlacedNearTop by remember(pageIndex) { mutableStateOf(false) }
+
+    var pageTextLayout by remember(controller, pageIndex) {
+        mutableStateOf(controller.getCachedPageTextLayout(pageIndex))
+    }
+
+    LaunchedEffect(controller, pageIndex, isActivePage) {
+        if (pageTextLayout != null) return@LaunchedEffect
+        if (!isActivePage) return@LaunchedEffect
+        pageTextLayout = controller.extractPageTextLayout(pageIndex)
+    }
 
     fun clearZoomTile() {
         zoomTile?.bitmap?.let { bmp ->
@@ -281,92 +344,267 @@ private fun PdfSinglePageSurface(
             }
         }
 
+        val currentTextLayoutUpdated by rememberUpdatedState(pageTextLayout)
+        val currentSelectionUpdated by rememberUpdatedState(activeSelection)
+        val currentBaseBmpUpdated by rememberUpdatedState(baseBmp)
+        val currentContentBoundsUpdated by rememberUpdatedState(contentBounds)
+        val currentFitModeUpdated by rememberUpdatedState(fitMode)
+        val currentTrimMarginsUpdated by rememberUpdatedState(trimMargins)
+        val currentOnUpdateSelection by rememberUpdatedState(onUpdateSelection)
+        val currentOnZoomStateChanged by rememberUpdatedState(onZoomStateChanged)
+        val currentOnTurnPrevious by rememberUpdatedState(onTurnPrevious)
+        val currentOnTurnNext by rememberUpdatedState(onTurnNext)
+        val currentOnToggleHud by rememberUpdatedState(onToggleHud)
+
+        fun touchToNormalizedPdf(touch: Offset, viewportSize: IntSize, bmp: Bitmap): Offset {
+            val rect = PdfDocumentController.computePdfDisplayRect(
+                viewportWidth = viewportSize.width.toFloat(),
+                viewportHeight = viewportSize.height.toFloat(),
+                bitmapWidth = bmp.width.toFloat(),
+                bitmapHeight = bmp.height.toFloat(),
+                contentBounds = currentContentBoundsUpdated,
+                fitMode = currentFitModeUpdated,
+                trimMargins = currentTrimMarginsUpdated
+            )
+            val px = viewportSize.width / 2f
+            val py = viewportSize.height / 2f
+            val left = px + (rect.pageLeft - px) * scale + offsetX
+            val top = py + (rect.pageTop - py) * scale + offsetY
+            val drawW = (rect.pageWidth * scale).coerceAtLeast(1f)
+            val drawH = (rect.pageHeight * scale).coerceAtLeast(1f)
+            return Offset(
+                x = (touch.x - left) / drawW,
+                y = (touch.y - top) / drawH
+            )
+        }
+
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
                 .fillMaxSize()
                 .pointerInput(pageIndex, totalPages) {
-                    detectTapGestures(
-                        onDoubleTap = { tapOffset ->
-                            if (scale > 1.05f) {
-                                scale = 1f
-                                offsetX = 0f
-                                offsetY = 0f
-                                clearZoomTile()
-                                onZoomStateChanged(false)
-                            } else {
-                                val targetScale = 2.2f
-                                val maxX = (size.width * (targetScale - 1f)) / 2f
-                                val maxY = (size.height * (targetScale - 1f)) / 2f
-                                val centerX = size.width / 2f
-                                val centerY = size.height / 2f
-                                scale = targetScale
-                                offsetX = ((centerX - tapOffset.x) * (targetScale - 1f)).coerceIn(-maxX, maxX)
-                                offsetY = ((centerY - tapOffset.y) * (targetScale - 1f)).coerceIn(-maxY, maxY)
-                                onZoomStateChanged(true)
-                            }
-                        },
-                        onTap = { tapOffset ->
-                            if (scale > 1.05f) {
-                                onToggleHud()
-                            } else {
-                                val w = size.width.toFloat().coerceAtLeast(1f)
-                                val ratio = tapOffset.x / w
-                                when {
-                                    ratio < 0.18f -> onTurnPrevious()
-                                    ratio > 0.82f -> onTurnNext()
-                                    else -> onToggleHud()
-                                }
-                            }
-                        }
-                    )
-                }
-                .pointerInput(pageIndex, fitMode, trimMargins, baseBmp) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false)
-                        do {
-                            val event = awaitPointerEvent()
-                            val pointerCount = event.changes.count { it.pressed }
-                            if (pointerCount >= 2 || scale > 1.02f) {
-                                val zoomChange = event.calculateZoom()
-                                val panChange = event.calculatePan()
+                    var lastTapTimeMs = 0L
+                    var lastTapPos = Offset.Zero
 
-                                val newScale = (scale * zoomChange).coerceIn(1f, 5f)
-                                if (newScale > 1.02f) {
-                                    val maxX = (size.width * (newScale - 1f)) / 2f
-                                    val maxY = (size.height * (newScale - 1f)) / 2f
-                                    scale = newScale
-                                    offsetX = (offsetX + panChange.x).coerceIn(-maxX, maxX)
-                                    offsetY = (offsetY + panChange.y).coerceIn(-maxY, maxY)
-                                    onZoomStateChanged(true)
-                                    event.changes.forEach { it.consume() }
-                                } else {
-                                    scale = 1f
-                                    offsetX = 0f
-                                    offsetY = 0f
-                                    clearZoomTile()
-                                    onZoomStateChanged(false)
+                    awaitEachGesture {
+                        val down = awaitFirstDown(requireUnconsumed = false)
+                        val downPos = down.position
+                        val longPress = if (currentEvent.changes.count { it.pressed } == 1) {
+                            awaitLongPressOrCancellation(down.id)
+                        } else {
+                            null
+                        }
+
+                        val bmp = currentBaseBmpUpdated
+                        if (longPress != null && bmp != null && currentEvent.changes.count { it.pressed } <= 1) {
+                            val layout = currentTextLayoutUpdated
+                            if (layout != null && layout.hasText) {
+                                val norm = touchToNormalizedPdf(longPress.position, size, bmp)
+                                val hit = layout.hitTestCharOffset(norm.x, norm.y, allowLooseDrag = true)
+                                if (hit != null) {
+                                    longPress.consume()
+                                    currentEvent.changes.forEach { it.consume() }
+                                    selectionAnchorOffset = hit
+                                    selectionPlacedNearTop = longPress.position.y < size.height * 0.32f
+                                    var (sStart, sEnd) = EpubSelectionHelper.expandToSentence(
+                                        layout.plainText,
+                                        hit
+                                    )
+                                    if (sEnd <= sStart) {
+                                        val wordRange = EpubSelectionHelper.expandRangeToWordBoundaries(
+                                            layout.plainText,
+                                            hit,
+                                            hit
+                                        )
+                                        sStart = wordRange.first
+                                        sEnd = wordRange.second
+                                    }
+                                    if (sEnd > sStart) {
+                                        currentOnUpdateSelection(
+                                            ChapterTextSelection(
+                                                chapterIndex = pageIndex,
+                                                startCharOffset = sStart,
+                                                endCharOffset = sEnd,
+                                                selectedText = layout.plainText.substring(sStart, sEnd)
+                                            )
+                                        )
+                                    }
+                                    var didDragMove = false
+                                    drag(longPress.id) { change ->
+                                        val moveDist = (change.position - longPress.position).getDistance()
+                                        if (moveDist > viewConfiguration.touchSlop * 0.6f) {
+                                            didDragMove = true
+                                        }
+                                        change.consume()
+                                        if (didDragMove) {
+                                            val dragNorm = touchToNormalizedPdf(change.position, size, bmp)
+                                            val dragHit = layout.hitTestCharOffset(
+                                                dragNorm.x,
+                                                dragNorm.y,
+                                                allowLooseDrag = true
+                                            )
+                                            if (dragHit != null) {
+                                                val range = EpubSelectionHelper.expandRangeToWordBoundaries(
+                                                    plainText = layout.plainText,
+                                                    offsetA = selectionAnchorOffset,
+                                                    offsetB = dragHit
+                                                )
+                                                if (range.second > range.first) {
+                                                    currentOnUpdateSelection(
+                                                        ChapterTextSelection(
+                                                            chapterIndex = pageIndex,
+                                                            startCharOffset = range.first,
+                                                            endCharOffset = range.second,
+                                                            selectedText = layout.plainText.substring(
+                                                                range.first,
+                                                                range.second
+                                                            )
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                    currentEvent.changes.forEach { it.consume() }
                                 }
-                            } else if (fitMode == PdfFitMode.FIT_WIDTH && baseBmp != null) {
-                                val rect = PdfDocumentController.computePdfDisplayRect(
-                                    viewportWidth = size.width.toFloat(),
-                                    viewportHeight = size.height.toFloat(),
-                                    bitmapWidth = baseBmp.width.toFloat(),
-                                    bitmapHeight = baseBmp.height.toFloat(),
-                                    contentBounds = contentBounds,
-                                    fitMode = fitMode,
-                                    trimMargins = trimMargins
-                                )
-                                val overflowY = (rect.contentDisplayHeight - size.height).coerceAtLeast(0f)
-                                if (overflowY > 4f) {
-                                    val pan = event.calculatePan()
-                                    if (abs(pan.y) > abs(pan.x) * 1.15f && abs(pan.y) > 1f) {
-                                        offsetY = (offsetY + pan.y).coerceIn(-overflowY, 0f)
-                                        event.changes.forEach { it.consume() }
+                            } else {
+                                val holdPos = longPress.position
+                                val viewportSz = size
+                                pageScope.launch {
+                                    val extracted = controller.extractPageTextLayout(pageIndex)
+                                    pageTextLayout = extracted
+                                    if (extracted.hasText) {
+                                        val norm = touchToNormalizedPdf(holdPos, viewportSz, bmp)
+                                        val hit = extracted.hitTestCharOffset(norm.x, norm.y, allowLooseDrag = true)
+                                        if (hit != null) {
+                                            selectionAnchorOffset = hit
+                                            selectionPlacedNearTop = holdPos.y < viewportSz.height * 0.32f
+                                            var (sStart, sEnd) = EpubSelectionHelper.expandToSentence(
+                                                extracted.plainText,
+                                                hit
+                                            )
+                                            if (sEnd <= sStart) {
+                                                val wordRange = EpubSelectionHelper.expandRangeToWordBoundaries(
+                                                    extracted.plainText,
+                                                    hit,
+                                                    hit
+                                                )
+                                                sStart = wordRange.first
+                                                sEnd = wordRange.second
+                                            }
+                                            if (sEnd > sStart) {
+                                                currentOnUpdateSelection(
+                                                    ChapterTextSelection(
+                                                        chapterIndex = pageIndex,
+                                                        startCharOffset = sStart,
+                                                        endCharOffset = sEnd,
+                                                        selectedText = extracted.plainText.substring(sStart, sEnd)
+                                                    )
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
-                        } while (event.changes.any { it.pressed })
+                        } else if (currentEvent.changes.all { !it.pressed }) {
+                            // Finger lifted before long-press timeout -> Tap or Double-Tap
+                            val upChange = currentEvent.changes.firstOrNull()
+                            val upPos = upChange?.position ?: downPos
+                            val withinSlop =
+                                (upPos - downPos).getDistance() <= viewConfiguration.touchSlop * 1.5f
+                            if (withinSlop && (upChange == null || !upChange.isConsumed)) {
+                                val now = SystemClock.uptimeMillis()
+                                val w = size.width.toFloat().coerceAtLeast(1f)
+                                val ratio = upPos.x / w
+                                val isDoubleTap = (now - lastTapTimeMs) in 40L..300L &&
+                                    (upPos - lastTapPos).getDistance() <= viewConfiguration.touchSlop * 3f &&
+                                    (scale > 1.05f || ratio in 0.18f..0.82f)
+
+                                if (currentSelectionUpdated != null) {
+                                    currentOnUpdateSelection(null)
+                                    lastTapTimeMs = 0L
+                                } else if (isDoubleTap) {
+                                    lastTapTimeMs = 0L
+                                    if (scale > 1.05f) {
+                                        scale = 1f
+                                        offsetX = 0f
+                                        offsetY = 0f
+                                        clearZoomTile()
+                                        currentOnZoomStateChanged(false)
+                                    } else {
+                                        val targetScale = 2.2f
+                                        val maxX = (size.width * (targetScale - 1f)) / 2f
+                                        val maxY = (size.height * (targetScale - 1f)) / 2f
+                                        val centerX = size.width / 2f
+                                        val centerY = size.height / 2f
+                                        scale = targetScale
+                                        offsetX = ((centerX - upPos.x) * (targetScale - 1f)).coerceIn(-maxX, maxX)
+                                        offsetY = ((centerY - upPos.y) * (targetScale - 1f)).coerceIn(-maxY, maxY)
+                                        currentOnZoomStateChanged(true)
+                                    }
+                                } else {
+                                    lastTapTimeMs = now
+                                    lastTapPos = upPos
+                                    if (scale > 1.05f) {
+                                        currentOnToggleHud()
+                                    } else {
+                                        when {
+                                            ratio < 0.18f -> currentOnTurnPrevious()
+                                            ratio > 0.82f -> currentOnTurnNext()
+                                            else -> currentOnToggleHud()
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            // Finger moved past touchSlop or 2nd finger went down -> Pinch-zoom / Pan loop
+                            do {
+                                val event = awaitPointerEvent()
+                                if (event.changes.any { it.isConsumed } || currentSelectionUpdated != null) {
+                                    continue
+                                }
+                                val pointerCount = event.changes.count { it.pressed }
+                                if (pointerCount >= 2 || scale > 1.02f) {
+                                    val zoomChange = event.calculateZoom()
+                                    val panChange = event.calculatePan()
+
+                                    val newScale = (scale * zoomChange).coerceIn(1f, 5f)
+                                    if (newScale > 1.02f) {
+                                        val maxX = (size.width * (newScale - 1f)) / 2f
+                                        val maxY = (size.height * (newScale - 1f)) / 2f
+                                        scale = newScale
+                                        offsetX = (offsetX + panChange.x).coerceIn(-maxX, maxX)
+                                        offsetY = (offsetY + panChange.y).coerceIn(-maxY, maxY)
+                                        currentOnZoomStateChanged(true)
+                                        event.changes.forEach { it.consume() }
+                                    } else {
+                                        scale = 1f
+                                        offsetX = 0f
+                                        offsetY = 0f
+                                        clearZoomTile()
+                                        currentOnZoomStateChanged(false)
+                                    }
+                                } else if (currentFitModeUpdated == PdfFitMode.FIT_WIDTH && bmp != null) {
+                                    val rect = PdfDocumentController.computePdfDisplayRect(
+                                        viewportWidth = size.width.toFloat(),
+                                        viewportHeight = size.height.toFloat(),
+                                        bitmapWidth = bmp.width.toFloat(),
+                                        bitmapHeight = bmp.height.toFloat(),
+                                        contentBounds = currentContentBoundsUpdated,
+                                        fitMode = currentFitModeUpdated,
+                                        trimMargins = currentTrimMarginsUpdated
+                                    )
+                                    val overflowY = (rect.contentDisplayHeight - size.height).coerceAtLeast(0f)
+                                    if (overflowY > 4f) {
+                                        val pan = event.calculatePan()
+                                        if (abs(pan.y) > abs(pan.x) * 1.15f && abs(pan.y) > 1f) {
+                                            offsetY = (offsetY + pan.y).coerceIn(-overflowY, 0f)
+                                            event.changes.forEach { it.consume() }
+                                        }
+                                    }
+                                }
+                            } while (event.changes.any { it.pressed })
+                        }
                     }
                 }
         ) {
@@ -407,7 +645,11 @@ private fun PdfSinglePageSurface(
                         colorFilter = colorFilter
                     )
 
-                    drawPdfSearchHighlights(
+                    drawPdfAnnotationsAndHighlights(
+                        pageTextLayout = pageTextLayout,
+                        pageHighlights = pageHighlights,
+                        pageSelectionBookmarks = pageSelectionBookmarks,
+                        activeSelection = activeSelection,
                         pageMatches = pageMatches,
                         activeMatch = activeMatch,
                         palette = palette,
@@ -435,7 +677,11 @@ private fun PdfSinglePageSurface(
                             colorFilter = colorFilter
                         )
 
-                        if (pageMatches.isNotEmpty()) {
+                        if (pageMatches.isNotEmpty() ||
+                            pageHighlights.isNotEmpty() ||
+                            pageSelectionBookmarks.isNotEmpty() ||
+                            activeSelection != null
+                        ) {
                             val rect = PdfDocumentController.computePdfDisplayRect(
                                 viewportWidth = size.width,
                                 viewportHeight = size.height,
@@ -448,7 +694,11 @@ private fun PdfSinglePageSurface(
                             val px = size.width / 2f
                             val py = size.height / 2f
 
-                            drawPdfSearchHighlights(
+                            drawPdfAnnotationsAndHighlights(
+                                pageTextLayout = pageTextLayout,
+                                pageHighlights = pageHighlights,
+                                pageSelectionBookmarks = pageSelectionBookmarks,
+                                activeSelection = activeSelection,
                                 pageMatches = pageMatches,
                                 activeMatch = activeMatch,
                                 palette = palette,
@@ -474,10 +724,136 @@ private fun PdfSinglePageSurface(
                     .size(24.dp)
             )
         }
+
+        val layout = pageTextLayout
+        if (activeSelection != null && layout != null) {
+            val hasOverlappingHighlight = pageHighlights.any { hl ->
+                hl.startCharOffset < activeSelection.endCharOffset &&
+                    hl.endCharOffset > activeSelection.startCharOffset
+            }
+            val isExactSelectionBookmarked = pageSelectionBookmarks.any { bm ->
+                bm.epubCharOffset == activeSelection.startCharOffset &&
+                    bm.epubEndCharOffset == activeSelection.endCharOffset
+            }
+
+            SelectionFloatingBar(
+                palette = palette,
+                hasOverlappingHighlight = hasOverlappingHighlight,
+                isSelectionBookmarked = isExactSelectionBookmarked,
+                onExpandSentence = {
+                    val (s, e) = EpubSelectionHelper.expandToSentence(
+                        layout.plainText,
+                        activeSelection.startCharOffset
+                    )
+                    val (safeS, safeE) = if (e > s) {
+                        s to e
+                    } else {
+                        EpubSelectionHelper.expandRangeToWordBoundaries(
+                            layout.plainText,
+                            activeSelection.startCharOffset,
+                            activeSelection.endCharOffset
+                        )
+                    }
+                    if (safeE > safeS) {
+                        onUpdateSelection(
+                            activeSelection.copy(
+                                startCharOffset = safeS,
+                                endCharOffset = safeE,
+                                selectedText = layout.plainText.substring(safeS, safeE)
+                            )
+                        )
+                    }
+                },
+                onExpandParagraph = {
+                    val (s, e) = EpubSelectionHelper.expandToParagraph(
+                        layout.plainText,
+                        activeSelection.startCharOffset
+                    )
+                    val (safeS, safeE) = if (e > s && (s < activeSelection.startCharOffset || e > activeSelection.endCharOffset)) {
+                        s to e
+                    } else {
+                        0 to layout.plainText.length
+                    }
+                    if (safeE > safeS) {
+                        onUpdateSelection(
+                            activeSelection.copy(
+                                startCharOffset = safeS,
+                                endCharOffset = safeE,
+                                selectedText = layout.plainText.substring(safeS, safeE)
+                            )
+                        )
+                    }
+                },
+                onPickHighlightColor = { color ->
+                    onApplyHighlight(
+                        pageIndex,
+                        activeSelection.startCharOffset,
+                        activeSelection.endCharOffset,
+                        activeSelection.selectedText,
+                        color
+                    )
+                    onUpdateSelection(null)
+                },
+                onClearHighlight = {
+                    onClearHighlight(
+                        pageIndex,
+                        activeSelection.startCharOffset,
+                        activeSelection.endCharOffset
+                    )
+                    onUpdateSelection(null)
+                },
+                onBookmarkSelection = {
+                    onBookmarkSelection(
+                        pageIndex,
+                        activeSelection.startCharOffset,
+                        activeSelection.endCharOffset,
+                        activeSelection.selectedText
+                    )
+                    onUpdateSelection(null)
+                },
+                onDismiss = { onUpdateSelection(null) },
+                modifier = Modifier
+                    .align(if (selectionPlacedNearTop) Alignment.BottomCenter else Alignment.TopCenter)
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+            )
+        }
     }
 }
 
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawPdfSearchHighlights(
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawNormalizedRectList(
+    rects: List<NormalizedRect>,
+    color: Color,
+    left: Float,
+    top: Float,
+    drawW: Float,
+    drawH: Float,
+    underlineColor: Color? = null
+) {
+    rects.forEach { norm ->
+        val rx = left + norm.left * drawW
+        val ry = top + norm.top * drawH
+        val rw = ((norm.right - norm.left) * drawW).coerceAtLeast(6f)
+        val rh = ((norm.bottom - norm.top) * drawH).coerceAtLeast(10f)
+        drawRect(
+            color = color,
+            topLeft = Offset(rx, ry),
+            size = Size(rx.let { rw }, rh)
+        )
+        if (underlineColor != null) {
+            drawRect(
+                color = underlineColor,
+                topLeft = Offset(rx, ry + rh - 2f),
+                size = Size(rw, 2f)
+            )
+        }
+    }
+}
+
+private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawPdfAnnotationsAndHighlights(
+    pageTextLayout: PdfPageTextLayout?,
+    pageHighlights: List<TextHighlight>,
+    pageSelectionBookmarks: List<Bookmark>,
+    activeSelection: ChapterTextSelection?,
     pageMatches: List<SearchMatch>,
     activeMatch: SearchMatch?,
     palette: ReaderPalette,
@@ -486,6 +862,36 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawPdfSearchHighli
     drawW: Float,
     drawH: Float
 ) {
+    if (pageTextLayout != null && pageTextLayout.hasText) {
+        // 1. Saved colored text highlights
+        pageHighlights.forEach { hl ->
+            val rects = pageTextLayout.rectsForRange(hl.startCharOffset, hl.endCharOffset)
+            drawNormalizedRectList(
+                rects = rects,
+                color = Color(hl.color.argbHex),
+                left = left,
+                top = top,
+                drawW = drawW,
+                drawH = drawH
+            )
+        }
+
+        // 2. Saved passage bookmarks (soft tint + accent underline)
+        pageSelectionBookmarks.forEach { bm ->
+            val rects = pageTextLayout.rectsForRange(bm.epubCharOffset, bm.epubEndCharOffset)
+            drawNormalizedRectList(
+                rects = rects,
+                color = palette.accent.copy(alpha = 0.14f),
+                left = left,
+                top = top,
+                drawW = drawW,
+                drawH = drawH,
+                underlineColor = palette.accent.copy(alpha = 0.75f)
+            )
+        }
+    }
+
+    // 3. In-book search matches
     pageMatches.forEach { match ->
         val isFocused = activeMatch != null && activeMatch.index == match.index
         val highlightColor = if (isFocused) {
@@ -495,19 +901,14 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawPdfSearchHighli
         }
 
         if (match.pdfRects.isNotEmpty()) {
-            match.pdfRects.forEach { norm ->
-                drawRect(
-                    color = highlightColor,
-                    topLeft = Offset(
-                        x = left + norm.left * drawW,
-                        y = top + norm.top * drawH
-                    ),
-                    size = Size(
-                        width = ((norm.right - norm.left) * drawW).coerceAtLeast(6f),
-                        height = ((norm.bottom - norm.top) * drawH).coerceAtLeast(10f)
-                    )
-                )
-            }
+            drawNormalizedRectList(
+                rects = match.pdfRects,
+                color = highlightColor,
+                left = left,
+                top = top,
+                drawW = drawW,
+                drawH = drawH
+            )
         } else if (isFocused) {
             drawRect(
                 color = highlightColor.copy(alpha = 0.22f),
@@ -515,5 +916,21 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawPdfSearchHighli
                 size = Size(drawW, 10f)
             )
         }
+    }
+
+    // 4. Live active text selection range
+    if (activeSelection != null && pageTextLayout != null && pageTextLayout.hasText) {
+        val rects = pageTextLayout.rectsForRange(
+            activeSelection.startCharOffset,
+            activeSelection.endCharOffset
+        )
+        drawNormalizedRectList(
+            rects = rects,
+            color = palette.accent.copy(alpha = 0.28f),
+            left = left,
+            top = top,
+            drawW = drawW,
+            drawH = drawH
+        )
     }
 }

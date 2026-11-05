@@ -162,7 +162,7 @@ fun TocAndBookmarksSheet(
                 1 -> {
                     if (bookmarks.isEmpty()) {
                         EmptySheetMessage(
-                            "No bookmarks saved yet.\nTap the top bookmark icon for a page, or long-press EPUB text to bookmark a sentence or paragraph."
+                            "No bookmarks saved yet.\nTap the top bookmark icon for a page, or long-press text in an EPUB or PDF to bookmark a sentence or paragraph."
                         )
                     } else {
                         LazyColumn(
@@ -249,7 +249,7 @@ fun TocAndBookmarksSheet(
                 2 -> {
                     if (highlights.isEmpty()) {
                         EmptySheetMessage(
-                            "No highlights yet.\nLong-press any sentence or paragraph in an EPUB to highlight it."
+                            "No highlights yet.\nLong-press any sentence or paragraph in an EPUB or PDF to highlight it."
                         )
                     } else {
                         LazyColumn(
