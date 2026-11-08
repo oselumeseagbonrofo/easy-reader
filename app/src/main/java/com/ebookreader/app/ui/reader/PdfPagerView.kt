@@ -769,17 +769,12 @@ private fun PdfSinglePageSurface(
                         layout.plainText,
                         activeSelection.startCharOffset
                     )
-                    val (safeS, safeE) = if (e > s && (s < activeSelection.startCharOffset || e > activeSelection.endCharOffset)) {
-                        s to e
-                    } else {
-                        0 to layout.plainText.length
-                    }
-                    if (safeE > safeS) {
+                    if (e > s) {
                         onUpdateSelection(
                             activeSelection.copy(
-                                startCharOffset = safeS,
-                                endCharOffset = safeE,
-                                selectedText = layout.plainText.substring(safeS, safeE)
+                                startCharOffset = s,
+                                endCharOffset = e,
+                                selectedText = layout.plainText.substring(s, e)
                             )
                         )
                     }

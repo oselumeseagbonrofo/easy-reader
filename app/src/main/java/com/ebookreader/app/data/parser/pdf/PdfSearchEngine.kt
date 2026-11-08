@@ -106,7 +106,11 @@ data class PdfPageTextLayout(
             val b = charBounds[i] ?: continue
             val h = (b.bottom - b.top).coerceAtLeast(0.006f)
             val midY = (b.top + b.bottom) * 0.5f
-            if (!lastMidY.isNaN() && kotlin.math.abs(midY - lastMidY) > maxOf(h, lastHeight) * 0.7f) {
+            val isNewLineWrap = !lastMidY.isNaN() && (
+                kotlin.math.abs(midY - lastMidY) > maxOf(h, lastHeight) * 0.65f ||
+                    (b.left < curRight - 0.18f && kotlin.math.abs(midY - lastMidY) > maxOf(h, lastHeight) * 0.35f)
+                )
+            if (isNewLineWrap) {
                 flushLine()
             }
             lastMidY = midY
@@ -227,6 +231,11 @@ object PdfSearchEngine {
         )
     }
 
+    data class RawTextMatch(
+        val textStartIndex: Int,
+        val bounds: List<NormalizedRect>
+    )
+
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     fun extractPageTextLayoutNativeApi35(
         page: PdfRenderer.Page,
@@ -244,9 +253,6 @@ object PdfSearchEngine {
                 pageHeightPts = page.height
             )
         }
-
-        val charBuilder = StringBuilder()
-        val charBounds = ArrayList<NormalizedRect?>()
         val fullText = contents.joinToString("\n") { it.text }
         if (fullText.isBlank()) {
             return PdfPageTextLayout(
@@ -258,53 +264,211 @@ object PdfSearchEngine {
             )
         }
 
-        // First try fast native SelectionBoundary(0)..SelectionBoundary(length) or PdfPageTextContent bounds
-        val allRects = ArrayList<android.graphics.RectF>()
-        for (c in contents) {
-            allRects.addAll(c.bounds)
-        }
-        if (allRects.isEmpty()) {
-            runCatching {
-                val sel = page.selectContent(
-                    SelectionBoundary(0),
-                    SelectionBoundary(fullText.length.coerceAtLeast(1))
-                )
-                for (sc in sel?.selectedTextContents.orEmpty()) {
-                    allRects.addAll(sc.bounds)
+        return buildNativeTextLayout(
+            pageIndex = pageIndex,
+            rawText = fullText,
+            pageWidthPts = page.width,
+            pageHeightPts = page.height,
+            lineBoundsProvider = { rawStart, rawEnd ->
+                val rects = ArrayList<NormalizedRect>()
+                runCatching {
+                    val sel = page.selectContent(
+                        SelectionBoundary(rawStart.coerceAtLeast(0)),
+                        SelectionBoundary(rawEnd.coerceAtLeast(rawStart + 1))
+                    )
+                    for (sc in sel?.selectedTextContents.orEmpty()) {
+                        for (r in sc.bounds) {
+                            if (r.right > r.left && r.bottom > r.top) {
+                                rects += NormalizedRect(
+                                    left = (r.left / pageWidth).coerceIn(0f, 1f),
+                                    top = (r.top / pageHeight).coerceIn(0f, 1f),
+                                    right = (r.right / pageWidth).coerceIn(0f, 1f),
+                                    bottom = (r.bottom / pageHeight).coerceIn(0f, 1f)
+                                )
+                            }
+                        }
+                    }
                 }
+                rects
+            },
+            tokenMatchesProvider = { token ->
+                runCatching {
+                    page.searchText(token).mapNotNull { mb ->
+                        val normRects = mb.bounds.mapNotNull { r ->
+                            if (r.right > r.left && r.bottom > r.top) {
+                                NormalizedRect(
+                                    left = (r.left / pageWidth).coerceIn(0f, 1f),
+                                    top = (r.top / pageHeight).coerceIn(0f, 1f),
+                                    right = (r.right / pageWidth).coerceIn(0f, 1f),
+                                    bottom = (r.bottom / pageHeight).coerceIn(0f, 1f)
+                                )
+                            } else {
+                                null
+                            }
+                        }
+                        if (normRects.isNotEmpty()) {
+                            RawTextMatch(textStartIndex = mb.textStartIndex, bounds = normRects)
+                        } else {
+                            null
+                        }
+                    }
+                }.getOrDefault(emptyList())
             }
+        )
+    }
+
+    private data class RawLineSpan(
+        val rawStart: Int,
+        val rawEnd: Int,
+        val text: String,
+        val precededByBlankLine: Boolean,
+        val lineRects: List<NormalizedRect>
+    )
+
+    fun buildNativeTextLayout(
+        pageIndex: Int,
+        rawText: String,
+        pageWidthPts: Int,
+        pageHeightPts: Int,
+        lineBoundsProvider: (rawLineStart: Int, rawLineEnd: Int) -> List<NormalizedRect>,
+        tokenMatchesProvider: (token: String) -> List<RawTextMatch>
+    ): PdfPageTextLayout {
+        val rawLineSpans = ArrayList<RawLineSpan>()
+        var cursor = 0
+        var sawBlankLine = false
+        while (cursor < rawText.length) {
+            val nlIdx = rawText.indexOf('\n', cursor).let { if (it < 0) rawText.length else it }
+            var trimStart = cursor
+            var trimEnd = nlIdx
+            while (trimStart < trimEnd && rawText[trimStart].isWhitespace()) trimStart++
+            while (trimEnd > trimStart && rawText[trimEnd - 1].isWhitespace()) trimEnd--
+            if (trimStart >= trimEnd) {
+                sawBlankLine = true
+            } else {
+                val lineRects = lineBoundsProvider(trimStart, trimEnd)
+                rawLineSpans += RawLineSpan(
+                    rawStart = trimStart,
+                    rawEnd = trimEnd,
+                    text = rawText.substring(trimStart, trimEnd),
+                    precededByBlankLine = sawBlankLine,
+                    lineRects = lineRects
+                )
+                sawBlankLine = false
+            }
+            cursor = nlIdx + 1
         }
 
-        // Detect paragraph breaks vs single line wraps inside the PDF page
-        val rawLines = fullText.split('\n')
-        for (lineIdx in rawLines.indices) {
-            val line = rawLines[lineIdx].trimEnd('\r').trim()
-            if (line.isBlank()) {
-                if (charBuilder.isNotEmpty() && charBuilder.last() != '\n') {
-                    charBuilder.append('\n')
-                    charBounds.add(null)
-                }
-                continue
-            }
-            if (charBuilder.isNotEmpty() && charBuilder.last() != '\n') {
-                val prevLine = rawLines.getOrNull(lineIdx - 1)?.trimEnd('\r')?.trim().orEmpty()
-                val prevEndsSentence = prevLine.endsWith('.') || prevLine.endsWith('!') ||
-                    prevLine.endsWith('?') || prevLine.endsWith(':')
-                val prevIsShort = prevLine.length < 48
-                if ((prevEndsSentence && prevLine.length < 68) || prevIsShort) {
-                    charBuilder.append('\n')
-                    charBounds.add(null)
+        if (rawLineSpans.isEmpty()) {
+            return PdfPageTextLayout(
+                pageIndex = pageIndex,
+                plainText = "",
+                charBounds = emptyList(),
+                pageWidthPts = pageWidthPts,
+                pageHeightPts = pageHeightPts
+            )
+        }
+
+        val allRects = if (rawLineSpans.all { it.lineRects.isEmpty() }) {
+            lineBoundsProvider(0, rawText.length.coerceAtLeast(1))
+        } else {
+            emptyList()
+        }
+
+        val maxLineRight = rawLineSpans.mapNotNull { span ->
+            span.lineRects.maxOfOrNull { it.right }
+        }.maxOrNull() ?: 0.85f
+        val minLineLeft = rawLineSpans.mapNotNull { span ->
+            span.lineRects.minOfOrNull { it.left }
+        }.minOrNull() ?: 0.10f
+        val maxLineChars = rawLineSpans.maxOfOrNull { it.text.length } ?: 72
+
+        val charBuilder = StringBuilder()
+        val charBounds = ArrayList<NormalizedRect?>()
+        val plainToRaw = ArrayList<Int>()
+        val linePlainRanges = ArrayList<IntRange>(rawLineSpans.size)
+
+        for (lineIdx in rawLineSpans.indices) {
+            val cur = rawLineSpans[lineIdx]
+            if (lineIdx > 0) {
+                val prev = rawLineSpans[lineIdx - 1]
+                val prevTrimmed = prev.text.trimEnd('"', '\'', '”', '’', ')')
+                val prevEndsSentence = prevTrimmed.endsWith('.') || prevTrimmed.endsWith('!') ||
+                    prevTrimmed.endsWith('?') || prevTrimmed.endsWith(':')
+
+                val isParagraphBreak = if (cur.precededByBlankLine) {
+                    true
+                } else if (prev.lineRects.isNotEmpty() && cur.lineRects.isNotEmpty()) {
+                    val prevTop = prev.lineRects.minOf { it.top }
+                    val prevBottom = prev.lineRects.maxOf { it.bottom }
+                    val prevLeft = prev.lineRects.minOf { it.left }
+                    val prevRight = prev.lineRects.maxOf { it.right }
+                    val curTop = cur.lineRects.minOf { it.top }
+                    val curBottom = cur.lineRects.maxOf { it.bottom }
+                    val curLeft = cur.lineRects.minOf { it.left }
+                    val refH = maxOf(prevBottom - prevTop, curBottom - curTop).coerceAtLeast(0.01f)
+
+                    val verticalGapBreak = (curTop - prevTop) > refH * 1.65f
+                    val firstLineIndentBreak = prevEndsSentence &&
+                        (curLeft > prevLeft + 0.022f || curLeft > minLineLeft + 0.025f)
+                    val shortLineBreak = prevEndsSentence &&
+                        prevRight < maxLineRight - 0.10f &&
+                        prev.text.length < (maxLineChars * 0.82f).toInt().coerceAtLeast(45)
+                    val headingBreak = prev.text.length < 40 && prevRight < maxLineRight - 0.18f
+
+                    verticalGapBreak || firstLineIndentBreak || shortLineBreak || headingBreak
                 } else {
-                    charBuilder.append(' ')
-                    charBounds.add(null)
+                    val prevIsShort = prev.text.length < 48
+                    (prevEndsSentence && prev.text.length < 68) || prevIsShort
+                }
+
+                charBuilder.append(if (isParagraphBreak) '\n' else ' ')
+                charBounds.add(null)
+                plainToRaw.add(cur.rawStart - 1)
+            }
+
+            val linePlainStart = charBuilder.length
+            for (rIdx in cur.rawStart until cur.rawEnd) {
+                val ch = rawText[rIdx]
+                if (ch == '\r') continue
+                charBuilder.append(ch)
+                charBounds.add(null)
+                plainToRaw.add(rIdx)
+            }
+            val linePlainEnd = charBuilder.length
+            linePlainRanges += (linePlainStart until linePlainEnd)
+
+            // Seed baseline character bounds for this specific line from its native line selection rect(s)
+            val effectiveLineRects = if (cur.lineRects.isNotEmpty()) {
+                cur.lineRects
+            } else if (allRects.isNotEmpty()) {
+                val fallbackIdx = ((lineIdx.toLong() * allRects.size) / rawLineSpans.size)
+                    .toInt()
+                    .coerceIn(0, allRects.lastIndex)
+                listOf(allRects[fallbackIdx])
+            } else {
+                emptyList()
+            }
+
+            val lineLen = linePlainEnd - linePlainStart
+            if (lineLen > 0 && effectiveLineRects.isNotEmpty()) {
+                val unionLeft = effectiveLineRects.minOf { it.left }
+                val unionTop = effectiveLineRects.minOf { it.top }
+                val unionRight = effectiveLineRects.maxOf { it.right }
+                val unionBottom = effectiveLineRects.maxOf { it.bottom }
+                val stepW = (unionRight - unionLeft) / lineLen.toFloat()
+                for (pIdx in linePlainStart until linePlainEnd) {
+                    val k = pIdx - linePlainStart
+                    charBounds[pIdx] = NormalizedRect(
+                        left = (unionLeft + k * stepW).coerceIn(0f, 1f),
+                        top = unionTop.coerceIn(0f, 1f),
+                        right = (unionLeft + (k + 1) * stepW).coerceIn(0f, 1f),
+                        bottom = unionBottom.coerceIn(0f, 1f)
+                    )
                 }
             }
-            charBuilder.append(line)
-            repeat(line.length) { charBounds.add(null) }
         }
 
         val plain = charBuilder.toString()
-        // Populate word-level bounds using native page.searchText for unique tokens or line rects
         val wordRegex = Regex("\\S+")
         val wordsByText = LinkedHashMap<String, MutableList<IntRange>>()
         for (m in wordRegex.findAll(plain)) {
@@ -314,59 +478,63 @@ object PdfSearchEngine {
             }
         }
 
-        var matchedChars = 0
         for ((token, ranges) in wordsByText) {
-            val matches = runCatching { page.searchText(token) }.getOrNull().orEmpty()
-            if (matches.isNotEmpty()) {
-                for (i in ranges.indices) {
-                    val range = ranges[i]
-                    val matchBound = matches.getOrNull(i) ?: matches.last()
-                    val rList = matchBound.bounds
-                    if (rList.isNotEmpty()) {
-                        val unionLeft = rList.minOf { it.left } / pageWidth
-                        val unionTop = rList.minOf { it.top } / pageHeight
-                        val unionRight = rList.maxOf { it.right } / pageWidth
-                        val unionBottom = rList.maxOf { it.bottom } / pageHeight
-                        val len = (range.last - range.first + 1).coerceAtLeast(1)
-                        val stepW = (unionRight - unionLeft) / len
-                        for (offset in range) {
-                            val k = offset - range.first
-                            charBounds[offset] = NormalizedRect(
-                                left = (unionLeft + k * stepW).coerceIn(0f, 1f),
-                                top = unionTop.coerceIn(0f, 1f),
-                                right = (unionLeft + (k + 1) * stepW).coerceIn(0f, 1f),
-                                bottom = unionBottom.coerceIn(0f, 1f)
-                            )
-                            matchedChars++
+            val matches = tokenMatchesProvider(token)
+            if (matches.isEmpty()) continue
+            for (range in ranges) {
+                val expectedRawStart = plainToRaw.getOrNull(range.first) ?: continue
+                val baseRect = charBounds.getOrNull(range.first)
+
+                // Match strictly by textStartIndex and same-line vertical bounds so earlier occurrences
+                // or substrings on the page are never assigned to this range.
+                val matchBound = matches
+                    .filter { mb ->
+                        val rawDist = kotlin.math.abs(mb.textStartIndex - expectedRawStart)
+                        if (rawDist > 3) return@filter false
+                        if (baseRect != null && mb.bounds.isNotEmpty()) {
+                            val mbTop = mb.bounds.minOf { it.top }
+                            val mbBottom = mb.bounds.maxOf { it.bottom }
+                            val mbMidY = (mbTop + mbBottom) * 0.5f
+                            val baseMidY = (baseRect.top + baseRect.bottom) * 0.5f
+                            val refH = maxOf(mbBottom - mbTop, baseRect.bottom - baseRect.top).coerceAtLeast(0.008f)
+                            kotlin.math.abs(mbMidY - baseMidY) <= refH * 1.25f
+                        } else {
+                            true
                         }
+                    }
+                    .minByOrNull { kotlin.math.abs(it.textStartIndex - expectedRawStart) }
+                    ?: continue
+
+                val rList = matchBound.bounds
+                if (rList.isNotEmpty()) {
+                    val unionLeft = rList.minOf { it.left }
+                    val unionTop = rList.minOf { it.top }
+                    val unionRight = rList.maxOf { it.right }
+                    val unionBottom = rList.maxOf { it.bottom }
+                    val len = (range.last - range.first + 1).coerceAtLeast(1)
+                    val stepW = (unionRight - unionLeft) / len
+                    for (offset in range) {
+                        val k = offset - range.first
+                        charBounds[offset] = NormalizedRect(
+                            left = (unionLeft + k * stepW).coerceIn(0f, 1f),
+                            top = unionTop.coerceIn(0f, 1f),
+                            right = (unionLeft + (k + 1) * stepW).coerceIn(0f, 1f),
+                            bottom = unionBottom.coerceIn(0f, 1f)
+                        )
                     }
                 }
             }
         }
 
-        // Fallback interpolation if any characters didn't get bounds from searchText
-        if (matchedChars == 0 && allRects.isNotEmpty() && plain.isNotEmpty()) {
-            val rectCount = allRects.size
-            for (i in plain.indices) {
-                if (plain[i].isWhitespace()) continue
-                val rIdx = ((i.toLong() * rectCount) / plain.length).toInt().coerceIn(0, rectCount - 1)
-                val r = allRects[rIdx]
-                charBounds[i] = NormalizedRect(
-                    left = (r.left / pageWidth).coerceIn(0f, 1f),
-                    top = (r.top / pageHeight).coerceIn(0f, 1f),
-                    right = (r.right / pageWidth).coerceIn(0f, 1f),
-                    bottom = (r.bottom / pageHeight).coerceIn(0f, 1f)
-                )
-            }
-        } else if (matchedChars > 0) {
-            // Fill gaps between matched tokens on the same line
-            var lastRect: NormalizedRect? = null
-            for (i in charBounds.indices) {
+        // Fill intra-line whitespace gaps strictly within each line (never across lines)
+        for (lineRange in linePlainRanges) {
+            var lastRectOnLine: NormalizedRect? = null
+            for (i in lineRange) {
                 val cur = charBounds[i]
                 if (cur != null) {
-                    lastRect = cur
-                } else if (plain[i] != '\n' && lastRect != null) {
-                    charBounds[i] = lastRect
+                    lastRectOnLine = cur
+                } else if (plain[i] != '\n' && lastRectOnLine != null) {
+                    charBounds[i] = lastRectOnLine
                 }
             }
         }
@@ -375,8 +543,8 @@ object PdfSearchEngine {
             pageIndex = pageIndex,
             plainText = plain,
             charBounds = charBounds,
-            pageWidthPts = page.width,
-            pageHeightPts = page.height
+            pageWidthPts = pageWidthPts,
+            pageHeightPts = pageHeightPts
         )
     }
 

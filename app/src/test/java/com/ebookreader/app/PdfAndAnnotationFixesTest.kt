@@ -382,4 +382,111 @@ class PdfAndAnnotationFixesTest {
             tempRoot.deleteRecursively()
         }
     }
+
+    @Test
+    fun `native PDF text layout highlights exact selected paragraph instead of first occurrences on page`() {
+        val para1Line1 = "The history of the city begins in an ancient valley where people lived in peace."
+        val para2Line1 = "In this chapter, we examine the architecture of a house in the old quarter."
+        val para2Line2 = "Second line of the target paragraph concludes the discussion."
+        val rawText = "$para1Line1\n\n$para2Line1\n$para2Line2"
+
+        val p1Start = 0
+        val p1End = para1Line1.length
+        val p2L1Start = p1End + 2
+        val p2L1End = p2L1Start + para2Line1.length
+        val p2L2Start = p2L1End + 1
+        val p2L2End = p2L2Start + para2Line2.length
+
+        fun rectForRawRange(rawStart: Int, rawEnd: Int): com.ebookreader.app.domain.model.NormalizedRect {
+            return when {
+                rawStart < p1End -> {
+                    val s = (rawStart - p1Start).coerceAtLeast(0).toFloat() / para1Line1.length
+                    val e = (rawEnd - p1Start).coerceAtMost(para1Line1.length).toFloat() / para1Line1.length
+                    com.ebookreader.app.domain.model.NormalizedRect(
+                        left = 0.10f + s * 0.80f,
+                        top = 0.10f,
+                        right = 0.10f + e * 0.80f,
+                        bottom = 0.125f
+                    )
+                }
+                rawStart < p2L1End -> {
+                    val s = (rawStart - p2L1Start).coerceAtLeast(0).toFloat() / para2Line1.length
+                    val e = (rawEnd - p2L1Start).coerceAtMost(para2Line1.length).toFloat() / para2Line1.length
+                    com.ebookreader.app.domain.model.NormalizedRect(
+                        left = 0.10f + s * 0.80f,
+                        top = 0.55f,
+                        right = 0.10f + e * 0.80f,
+                        bottom = 0.575f
+                    )
+                }
+                else -> {
+                    val s = (rawStart - p2L2Start).coerceAtLeast(0).toFloat() / para2Line2.length
+                    val e = (rawEnd - p2L2Start).coerceAtMost(para2Line2.length).toFloat() / para2Line2.length
+                    com.ebookreader.app.domain.model.NormalizedRect(
+                        left = 0.10f + s * 0.75f,
+                        top = 0.59f,
+                        right = 0.10f + e * 0.75f,
+                        bottom = 0.615f
+                    )
+                }
+            }
+        }
+
+        val layout = com.ebookreader.app.data.parser.pdf.PdfSearchEngine.buildNativeTextLayout(
+            pageIndex = 0,
+            rawText = rawText,
+            pageWidthPts = 600,
+            pageHeightPts = 800,
+            lineBoundsProvider = { rawStart, rawEnd ->
+                if (rawStart == 0 && rawEnd >= rawText.length) {
+                    listOf(
+                        rectForRawRange(p1Start, p1End),
+                        rectForRawRange(p2L1Start, p2L1End),
+                        rectForRawRange(p2L2Start, p2L2End)
+                    )
+                } else {
+                    listOf(rectForRawRange(rawStart, rawEnd))
+                }
+            },
+            tokenMatchesProvider = { query ->
+                val results = ArrayList<com.ebookreader.app.data.parser.pdf.PdfSearchEngine.RawTextMatch>()
+                var cursor = 0
+                while (cursor < rawText.length) {
+                    val idx = rawText.indexOf(query, startIndex = cursor, ignoreCase = true)
+                    if (idx < 0) break
+                    results += com.ebookreader.app.data.parser.pdf.PdfSearchEngine.RawTextMatch(
+                        textStartIndex = idx,
+                        bounds = listOf(rectForRawRange(idx, idx + query.length))
+                    )
+                    cursor = idx + 1
+                }
+                results
+            }
+        )
+
+        // Hit-test inside Paragraph 2 (y = 0.56f) and expand to Paragraph 2
+        val hitInPara2 = layout.hitTestCharOffset(normX = 0.35f, normY = 0.56f)
+        org.junit.Assert.assertNotNull("Expected hit inside Paragraph 2", hitInPara2)
+        val (paraStart, paraEnd) = com.ebookreader.app.data.parser.epub.EpubSelectionHelper.expandToParagraph(
+            layout.plainText,
+            hitInPara2!!
+        )
+        val selectedSnippet = layout.plainText.substring(paraStart, paraEnd)
+        assertEquals("$para2Line1 $para2Line2", selectedSnippet)
+
+        // Highlight rectangles for Paragraph 2 must ONLY cover Paragraph 2 (top >= 0.50f),
+        // NEVER leaking to first occurrences of words ("In", "the", "of", "a", "in") in Paragraph 1 (top = 0.10f).
+        val highlightRects = layout.rectsForRange(paraStart, paraEnd)
+        assertEquals(
+            "Expected exactly 2 highlight line rects for the 2-line second paragraph, but got: $highlightRects",
+            2,
+            highlightRects.size
+        )
+        for (rect in highlightRects) {
+            assertTrue(
+                "Highlight rect leaked outside Paragraph 2 into earlier occurrence on page: $rect",
+                rect.top >= 0.50f && rect.bottom <= 0.65f
+            )
+        }
+    }
 }
