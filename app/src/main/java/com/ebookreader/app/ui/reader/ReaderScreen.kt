@@ -246,6 +246,9 @@ fun ReaderScreen(
                                         onApplyHighlight = viewModel::applyHighlight,
                                         onClearHighlight = viewModel::clearHighlightRange,
                                         onBookmarkSelection = viewModel::toggleSelectionBookmark,
+                                        onSelectionActiveChanged = { active ->
+                                            if (active) isHudVisible = false
+                                        },
                                         onToggleHud = {
                                             if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
                                                 viewModel.setSearchResultsExpanded(false)
@@ -268,6 +271,9 @@ fun ReaderScreen(
                                     onApplyHighlight = viewModel::applyHighlight,
                                     onClearHighlight = viewModel::clearHighlightRange,
                                     onBookmarkSelection = viewModel::toggleSelectionBookmark,
+                                    onSelectionActiveChanged = { active ->
+                                        if (active) isHudVisible = false
+                                    },
                                     onToggleHud = {
                                         if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
                                             viewModel.setSearchResultsExpanded(false)

@@ -101,12 +101,17 @@ fun EpubPagerView(
     onClearHighlight: (chapterIndex: Int, startOffset: Int, endOffset: Int) -> Unit,
     onBookmarkSelection: (chapterIndex: Int, startOffset: Int, endOffset: Int, selectedText: String) -> Unit,
     onToggleHud: () -> Unit,
+    onSelectionActiveChanged: ((Boolean) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val coroutineScope = rememberCoroutineScope()
     var activeSelection by remember { mutableStateOf<ChapterTextSelection?>(null) }
     var selectionAnchorOffset by remember { mutableIntStateOf(0) }
     var selectionPlacedNearTop by remember { mutableStateOf(false) }
+
+    LaunchedEffect(activeSelection) {
+        onSelectionActiveChanged?.invoke(activeSelection != null)
+    }
 
     // Clear live text selection if the user navigates to another page
     LaunchedEffect(pagerState.currentPage) {

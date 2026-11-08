@@ -96,11 +96,16 @@ fun PdfPagerView(
     onClearHighlight: (chapterIndex: Int, startOffset: Int, endOffset: Int) -> Unit,
     onBookmarkSelection: (chapterIndex: Int, startOffset: Int, endOffset: Int, selectedText: String) -> Unit,
     onToggleHud: () -> Unit,
+    onSelectionActiveChanged: ((Boolean) -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val coroutineScope = rememberCoroutineScope()
     var activePageZoomed by remember { mutableStateOf(false) }
     var activeSelection by remember { mutableStateOf<ChapterTextSelection?>(null) }
+
+    LaunchedEffect(activeSelection) {
+        onSelectionActiveChanged?.invoke(activeSelection != null)
+    }
 
     val bookmarkedPages = remember(bookmarks) {
         bookmarks.filter { !it.isTextSelection }.map { it.pageIndex }.toSet()
