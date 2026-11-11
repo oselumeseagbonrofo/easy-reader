@@ -6,21 +6,28 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.gestures.awaitLongPressOrCancellation
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.PagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.ZoomOutMap
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -42,6 +49,7 @@ import androidx.compose.ui.graphics.ColorFilter
 import androidx.compose.ui.graphics.ColorMatrix
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntOffset
@@ -394,15 +402,70 @@ private fun PdfSinglePageSurface(
                     awaitEachGesture {
                         val down = awaitFirstDown(requireUnconsumed = false)
                         val downPos = down.position
-                        val longPress = if (currentEvent.changes.count { it.pressed } == 1) {
-                            awaitLongPressOrCancellation(down.id)
+                        val touchSlop = viewConfiguration.touchSlop
+                        val longPressTimeout = viewConfiguration.longPressTimeoutMillis
+
+                        var secondPointerDown = false
+                        var hasMovedPastSlop = false
+                        var liftedEarly = false
+                        var upPos = downPos
+                        var longPressChange: PointerInputChange? = null
+
+                        // When zoomed, a tiny movement starts panning immediately (no long-press race).
+                        val moveSlop = if (scale > 1.02f) touchSlop / 4f else touchSlop
+
+                        if (currentEvent.changes.count { it.pressed } > 1) {
+                            secondPointerDown = true
                         } else {
-                            null
+                            // NOTE: inside the pointer scope this is AwaitPointerEventScope.withTimeoutOrNull,
+                            // whose timeout is NOT a kotlinx TimeoutCancellationException — so never try/catch it.
+                            val finishedBeforeTimeout = withTimeoutOrNull(longPressTimeout) {
+                                    while (true) {
+                                        val event = awaitPointerEvent()
+                                        val pressedCount = event.changes.count { it.pressed }
+                                        if (pressedCount > 1) {
+                                            secondPointerDown = true
+                                            break
+                                        }
+                                        if (event.changes.all { !it.pressed }) {
+                                            liftedEarly = true
+                                            upPos = event.changes.firstOrNull()?.position ?: downPos
+                                            break
+                                        }
+                                        val currentInput = event.changes.firstOrNull { it.id == down.id }
+                                        if (currentInput == null || !currentInput.pressed) {
+                                            liftedEarly = true
+                                            upPos = currentInput?.position ?: downPos
+                                            break
+                                        }
+                                        if ((currentInput.position - downPos).getDistance() > moveSlop) {
+                                            hasMovedPastSlop = true
+                                            if (scale > 1.02f) {
+                                                // Apply this first movement as pan and keep it from the pager
+                                                val maxX = (size.width * (scale - 1f)) / 2f
+                                                val maxY = (size.height * (scale - 1f)) / 2f
+                                                val delta = currentInput.position - currentInput.previousPosition
+                                                offsetX = (offsetX + delta.x).coerceIn(-maxX, maxX)
+                                                offsetY = (offsetY + delta.y).coerceIn(-maxY, maxY)
+                                                currentInput.consume()
+                                            }
+                                            break
+                                        }
+                                    }
+                                    true
+                                }
+                            if (finishedBeforeTimeout == null) {
+                                val currentInput = currentEvent.changes.firstOrNull { it.id == down.id }
+                                if (currentInput != null && currentInput.pressed && currentEvent.changes.count { it.pressed } == 1) {
+                                    longPressChange = currentInput
+                                }
+                            }
                         }
 
                         val bmp = currentBaseBmpUpdated
-                        if (longPress != null && bmp != null && currentEvent.changes.count { it.pressed } <= 1) {
+                        if (longPressChange != null && bmp != null && currentEvent.changes.count { it.pressed } <= 1) {
                             val layout = currentTextLayoutUpdated
+                            val longPress = longPressChange
                             if (layout != null && layout.hasText) {
                                 val norm = touchToNormalizedPdf(longPress.position, size, bmp)
                                 val hit = layout.hitTestCharOffset(norm.x, norm.y, allowLooseDrag = true)
@@ -437,7 +500,7 @@ private fun PdfSinglePageSurface(
                                     var didDragMove = false
                                     drag(longPress.id) { change ->
                                         val moveDist = (change.position - longPress.position).getDistance()
-                                        if (moveDist > viewConfiguration.touchSlop * 0.6f) {
+                                        if (moveDist > touchSlop * 0.6f) {
                                             didDragMove = true
                                         }
                                         change.consume()
@@ -511,42 +574,38 @@ private fun PdfSinglePageSurface(
                                     }
                                 }
                             }
-                        } else if (currentEvent.changes.all { !it.pressed }) {
-                            // Finger lifted before long-press timeout -> Tap or Double-Tap
-                            val upChange = currentEvent.changes.firstOrNull()
-                            val upPos = upChange?.position ?: downPos
-                            val withinSlop =
-                                (upPos - downPos).getDistance() <= viewConfiguration.touchSlop * 1.5f
-                            if (withinSlop && (upChange == null || !upChange.isConsumed)) {
+                        } else if (liftedEarly || currentEvent.changes.all { !it.pressed }) {
+                            // Finger lifted before timeout -> Tap or Double-Tap
+                            val withinSlop = (upPos - downPos).getDistance() <= touchSlop * 1.5f
+                            if (withinSlop) {
                                 val now = SystemClock.uptimeMillis()
                                 val w = size.width.toFloat().coerceAtLeast(1f)
                                 val ratio = upPos.x / w
-                                val isDoubleTap = (now - lastTapTimeMs) in 40L..300L &&
-                                    (upPos - lastTapPos).getDistance() <= viewConfiguration.touchSlop * 3f &&
+                                val isDoubleTap = (now - lastTapTimeMs) in 40L..380L &&
+                                    (upPos - lastTapPos).getDistance() <= touchSlop * 3f &&
                                     (scale > 1.05f || ratio in 0.18f..0.82f)
 
-                                if (currentSelectionUpdated != null) {
+                                if (isDoubleTap) {
+                                    lastTapTimeMs = 0L
                                     currentOnUpdateSelection(null)
-                                    lastTapTimeMs = 0L
-                                } else if (isDoubleTap) {
-                                    lastTapTimeMs = 0L
-                                    if (scale > 1.05f) {
-                                        scale = 1f
-                                        offsetX = 0f
-                                        offsetY = 0f
+                                    val newZoom = PdfZoomGestureHelper.calculateDoubleTapZoom(
+                                        currentState = ZoomPanState(scale, offsetX, offsetY, scale > 1.05f),
+                                        tapPosition = upPos,
+                                        viewportWidth = size.width.toFloat(),
+                                        viewportHeight = size.height.toFloat()
+                                    )
+                                    scale = newZoom.scale
+                                    offsetX = newZoom.offsetX
+                                    offsetY = newZoom.offsetY
+                                    if (!newZoom.isZoomed) {
                                         clearZoomTile()
-                                        currentOnZoomStateChanged(false)
-                                    } else {
-                                        val targetScale = 2.2f
-                                        val maxX = (size.width * (targetScale - 1f)) / 2f
-                                        val maxY = (size.height * (targetScale - 1f)) / 2f
-                                        val centerX = size.width / 2f
-                                        val centerY = size.height / 2f
-                                        scale = targetScale
-                                        offsetX = ((centerX - upPos.x) * (targetScale - 1f)).coerceIn(-maxX, maxX)
-                                        offsetY = ((centerY - upPos.y) * (targetScale - 1f)).coerceIn(-maxY, maxY)
-                                        currentOnZoomStateChanged(true)
                                     }
+                                    currentOnZoomStateChanged(newZoom.isZoomed)
+                                } else if (currentSelectionUpdated != null) {
+                                    // Single tap clears active text selection
+                                    currentOnUpdateSelection(null)
+                                    lastTapTimeMs = now
+                                    lastTapPos = upPos
                                 } else {
                                     lastTapTimeMs = now
                                     lastTapPos = upPos
@@ -562,10 +621,13 @@ private fun PdfSinglePageSurface(
                                 }
                             }
                         } else {
-                            // Finger moved past touchSlop or 2nd finger went down -> Pinch-zoom / Pan loop
+                            // Multi-touch pinch or one-finger drag past slop -> Pinch-zoom / Pan loop
+                            if (currentSelectionUpdated != null) {
+                                currentOnUpdateSelection(null)
+                            }
                             do {
                                 val event = awaitPointerEvent()
-                                if (event.changes.any { it.isConsumed } || currentSelectionUpdated != null) {
+                                if (scale <= 1.02f && event.changes.any { it.isConsumed }) {
                                     continue
                                 }
                                 val pointerCount = event.changes.count { it.pressed }
@@ -573,22 +635,21 @@ private fun PdfSinglePageSurface(
                                     val zoomChange = event.calculateZoom()
                                     val panChange = event.calculatePan()
 
-                                    val newScale = (scale * zoomChange).coerceIn(1f, 5f)
-                                    if (newScale > 1.02f) {
-                                        val maxX = (size.width * (newScale - 1f)) / 2f
-                                        val maxY = (size.height * (newScale - 1f)) / 2f
-                                        scale = newScale
-                                        offsetX = (offsetX + panChange.x).coerceIn(-maxX, maxX)
-                                        offsetY = (offsetY + panChange.y).coerceIn(-maxY, maxY)
-                                        currentOnZoomStateChanged(true)
-                                        event.changes.forEach { it.consume() }
-                                    } else {
-                                        scale = 1f
-                                        offsetX = 0f
-                                        offsetY = 0f
+                                    val newZoom = PdfZoomGestureHelper.calculateZoomPan(
+                                        currentState = ZoomPanState(scale, offsetX, offsetY, scale > 1.02f),
+                                        zoomChange = zoomChange,
+                                        panChange = panChange,
+                                        viewportWidth = size.width.toFloat(),
+                                        viewportHeight = size.height.toFloat()
+                                    )
+                                    scale = newZoom.scale
+                                    offsetX = newZoom.offsetX
+                                    offsetY = newZoom.offsetY
+                                    if (!newZoom.isZoomed) {
                                         clearZoomTile()
-                                        currentOnZoomStateChanged(false)
                                     }
+                                    currentOnZoomStateChanged(newZoom.isZoomed)
+                                    event.changes.forEach { it.consume() }
                                 } else if (currentFitModeUpdated == PdfFitMode.FIT_WIDTH && bmp != null) {
                                     val rect = PdfDocumentController.computePdfDisplayRect(
                                         viewportWidth = size.width.toFloat(),
@@ -728,6 +789,43 @@ private fun PdfSinglePageSurface(
                     .padding(end = 10.dp)
                     .size(24.dp)
             )
+        }
+
+        if (scale > 1.05f) {
+            Surface(
+                onClick = {
+                    scale = 1f
+                    offsetX = 0f
+                    offsetY = 0f
+                    clearZoomTile()
+                    onZoomStateChanged(false)
+                    onUpdateSelection(null)
+                },
+                shape = CircleShape,
+                color = palette.hudContainer.copy(alpha = 0.95f),
+                shadowElevation = 4.dp,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 16.dp, bottom = 24.dp)
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ZoomOutMap,
+                        contentDescription = "Reset Zoom",
+                        tint = palette.onHudContainer,
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        text = "${((scale * 10).roundToInt() / 10f)}x • Reset",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = palette.onHudContainer
+                    )
+                }
+            }
         }
 
         val layout = pageTextLayout
