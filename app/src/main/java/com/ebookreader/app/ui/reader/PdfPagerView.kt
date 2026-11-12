@@ -120,7 +120,9 @@ fun PdfPagerView(
     }
 
     LaunchedEffect(pagerState.settledPage) {
-        activePageZoomed = false
+        if (PdfZoomGestureHelper.shouldResetZoomOnSettledPage(pagerState.settledPage, pagerState.currentPage)) {
+            activePageZoomed = false
+        }
     }
 
     LaunchedEffect(pagerState.currentPage) {
@@ -130,7 +132,11 @@ fun PdfPagerView(
     HorizontalPager(
         state = pagerState,
         beyondViewportPageCount = 1,
-        userScrollEnabled = !activePageZoomed && activeSelection == null,
+        userScrollEnabled = PdfZoomGestureHelper.isPdfPagerScrollEnabled(
+            activePageZoomed = activePageZoomed,
+            activeSelectionPage = activeSelection?.chapterIndex,
+            currentPage = pagerState.currentPage
+        ),
         modifier = modifier
             .fillMaxSize()
             .background(palette.background)
@@ -244,8 +250,10 @@ private fun PdfSinglePageSurface(
     }
 
     fun clearZoomTile() {
-        zoomTile?.bitmap?.let { bmp ->
-            if (!bmp.isRecycled) bmp.recycle()
+        if (PdfZoomGestureHelper.shouldRecycleDisposedZoomTileBitmap()) {
+            zoomTile?.bitmap?.let { bmp ->
+                if (!bmp.isRecycled) bmp.recycle()
+            }
         }
         zoomTile = null
     }
@@ -255,15 +263,25 @@ private fun PdfSinglePageSurface(
     }
 
     LaunchedEffect(isActivePage, fitMode, trimMargins) {
-        if ((!isActivePage && scale != 1f) || scale != 1f) {
-            if (!isActivePage) {
-                scale = 1f
-                offsetX = 0f
-                offsetY = 0f
-                clearZoomTile()
-            }
+        val (reconciled, notifyNotZoomed) = PdfZoomGestureHelper.reconcileLayoutEffect(
+            currentState = ZoomPanState(
+                scale = scale,
+                offsetX = offsetX,
+                offsetY = offsetY,
+                isZoomed = scale > PdfZoomGestureHelper.ZOOM_THRESHOLD
+            ),
+            isActivePage = isActivePage
+        )
+        val shouldClearTile = !isActivePage && scale != 1f
+        scale = reconciled.scale
+        offsetX = reconciled.offsetX
+        offsetY = reconciled.offsetY
+        if (shouldClearTile) {
+            clearZoomTile()
         }
-        offsetY = 0f
+        if (notifyNotZoomed) {
+            onZoomStateChanged(false)
+        }
     }
 
     val paddingMod = if (fitMode == PdfFitMode.FIT_PAGE) {
@@ -351,7 +369,9 @@ private fun PdfSinglePageSurface(
                     fitMode = fitMode,
                     trimMargins = trimMargins
                 )
-                if (previous != null && previous.bitmap !== renderedTile && !previous.bitmap.isRecycled) {
+                if (PdfZoomGestureHelper.shouldRecycleDisposedZoomTileBitmap() &&
+                    previous != null && previous.bitmap !== renderedTile && !previous.bitmap.isRecycled
+                ) {
                     previous.bitmap.recycle()
                 }
             }
@@ -364,6 +384,8 @@ private fun PdfSinglePageSurface(
         val currentFitModeUpdated by rememberUpdatedState(fitMode)
         val currentTrimMarginsUpdated by rememberUpdatedState(trimMargins)
         val currentOnUpdateSelection by rememberUpdatedState(onUpdateSelection)
+        val currentIsActivePageUpdated by rememberUpdatedState(isActivePage)
+        val currentScaleUpdated by rememberUpdatedState(scale)
         val currentOnZoomStateChanged by rememberUpdatedState(onZoomStateChanged)
         val currentOnTurnPrevious by rememberUpdatedState(onTurnPrevious)
         val currentOnTurnNext by rememberUpdatedState(onTurnNext)
@@ -541,6 +563,13 @@ private fun PdfSinglePageSurface(
                                 pageScope.launch {
                                     val extracted = controller.extractPageTextLayout(pageIndex)
                                     pageTextLayout = extracted
+                                    if (!PdfZoomGestureHelper.canApplyAsyncSelection(
+                                            isActivePage = currentIsActivePageUpdated,
+                                            isGestureInProgress = currentScaleUpdated > PdfZoomGestureHelper.ZOOM_THRESHOLD
+                                        )
+                                    ) {
+                                        return@launch
+                                    }
                                     if (extracted.hasText) {
                                         val norm = touchToNormalizedPdf(holdPos, viewportSz, bmp)
                                         val hit = extracted.hitTestCharOffset(norm.x, norm.y, allowLooseDrag = true)

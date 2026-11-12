@@ -19,7 +19,18 @@ private val Context.readerDataStore: DataStore<Preferences> by preferencesDataSt
     name = "reader_preferences"
 )
 
-class ReaderPreferencesRepository(private val context: Context) {
+interface ReaderPreferencesSource {
+    val settingsFlow: Flow<ReaderSettings>
+    suspend fun updateTheme(theme: ReaderTheme)
+    suspend fun updateFontSize(sizeSp: Float)
+    suspend fun updateLineHeight(multiplier: Float)
+    suspend fun updateFontFamily(family: ReaderFontFamily)
+    suspend fun updatePdfInvertInDark(invert: Boolean)
+    suspend fun updatePdfFitMode(mode: PdfFitMode)
+    suspend fun updatePdfTrimMargins(trim: Boolean)
+}
+
+class ReaderPreferencesRepository(private val context: Context) : ReaderPreferencesSource {
 
     private object Keys {
         val THEME = stringPreferencesKey("theme")
@@ -31,7 +42,7 @@ class ReaderPreferencesRepository(private val context: Context) {
         val PDF_TRIM_MARGINS = booleanPreferencesKey("pdf_trim_margins")
     }
 
-    val settingsFlow: Flow<ReaderSettings> = context.readerDataStore.data.map { prefs ->
+    override val settingsFlow: Flow<ReaderSettings> = context.readerDataStore.data.map { prefs ->
         val theme = prefs[Keys.THEME]
             ?.let { runCatching { ReaderTheme.valueOf(it) }.getOrNull() }
             ?: ReaderTheme.PAPER
@@ -52,31 +63,31 @@ class ReaderPreferencesRepository(private val context: Context) {
         )
     }
 
-    suspend fun updateTheme(theme: ReaderTheme) {
+    override suspend fun updateTheme(theme: ReaderTheme) {
         context.readerDataStore.edit { it[Keys.THEME] = theme.name }
     }
 
-    suspend fun updateFontSize(sizeSp: Float) {
+    override suspend fun updateFontSize(sizeSp: Float) {
         context.readerDataStore.edit { it[Keys.FONT_SIZE_SP] = sizeSp.coerceIn(14f, 28f) }
     }
 
-    suspend fun updateLineHeight(multiplier: Float) {
+    override suspend fun updateLineHeight(multiplier: Float) {
         context.readerDataStore.edit { it[Keys.LINE_HEIGHT] = multiplier.coerceIn(1.2f, 1.9f) }
     }
 
-    suspend fun updateFontFamily(family: ReaderFontFamily) {
+    override suspend fun updateFontFamily(family: ReaderFontFamily) {
         context.readerDataStore.edit { it[Keys.FONT_FAMILY] = family.name }
     }
 
-    suspend fun updatePdfInvertInDark(invert: Boolean) {
+    override suspend fun updatePdfInvertInDark(invert: Boolean) {
         context.readerDataStore.edit { it[Keys.PDF_INVERT_DARK] = invert }
     }
 
-    suspend fun updatePdfFitMode(mode: PdfFitMode) {
+    override suspend fun updatePdfFitMode(mode: PdfFitMode) {
         context.readerDataStore.edit { it[Keys.PDF_FIT_MODE] = mode.name }
     }
 
-    suspend fun updatePdfTrimMargins(trim: Boolean) {
+    override suspend fun updatePdfTrimMargins(trim: Boolean) {
         context.readerDataStore.edit { it[Keys.PDF_TRIM_MARGINS] = trim }
     }
 }

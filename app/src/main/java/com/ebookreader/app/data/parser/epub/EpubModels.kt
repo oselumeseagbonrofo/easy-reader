@@ -1,6 +1,7 @@
 package com.ebookreader.app.data.parser.epub
 
 import androidx.compose.ui.text.AnnotatedString
+import com.ebookreader.app.domain.model.Bookmark
 import com.ebookreader.app.domain.model.TocEntry
 
 enum class EpubTextKind {
@@ -105,4 +106,7 @@ data class PaginatedEpub(
         val closestBefore = chapterPages.lastOrNull { it.startCharOffset <= charOffset }
         return (closestBefore ?: chapterPages.first()).globalPageIndex
     }
+
+    fun resolvePageForBookmark(bookmark: Bookmark): Int =
+        findPageForAnchor(bookmark.epubChapterIndex, bookmark.epubCharOffset)
 }

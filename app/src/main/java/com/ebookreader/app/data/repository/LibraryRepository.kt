@@ -24,6 +24,7 @@ import com.ebookreader.app.domain.model.Bookmark
 import com.ebookreader.app.domain.model.HighlightColor
 import com.ebookreader.app.domain.model.ReadingProgressCalculator
 import com.ebookreader.app.domain.model.TextHighlight
+import com.ebookreader.app.domain.model.runCatchingCancellable
 import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import kotlinx.coroutines.Dispatchers
@@ -39,15 +40,99 @@ import java.io.FileNotFoundException
 import java.io.FileOutputStream
 import java.security.MessageDigest
 
-class LibraryRepository(
+internal interface LibraryShelfSource {
+    fun observeBooks(): Flow<List<Book>>
+    suspend fun linkExternalBookUri(uriString: String, originalUri: Uri? = null): Result<Book>
+    suspend fun relinkBookUriString(bookId: String, newUriString: String, originalUri: Uri? = null): Result<Book>
+    suspend fun removeBookFromShelf(book: Book)
+}
+
+interface ReaderBookRepository {
+    suspend fun getBookById(bookId: String): Book?
+    suspend fun saveReadingProgress(
+        bookId: String,
+        currentPage: Int,
+        totalPages: Int,
+        epubChapterIndex: Int = 0,
+        epubCharOffset: Int = 0
+    )
+    fun observeBookmarks(bookId: String): Flow<List<Bookmark>>
+    fun observeHighlights(bookId: String): Flow<List<TextHighlight>>
+    suspend fun toggleBookmark(
+        bookId: String,
+        pageIndex: Int,
+        totalPages: Int,
+        epubChapterIndex: Int,
+        epubCharOffset: Int,
+        chapterTitle: String,
+        snippet: String
+    ): Boolean
+    suspend fun toggleSelectionBookmark(
+        bookId: String,
+        pageIndex: Int,
+        totalPages: Int,
+        chapterIndex: Int,
+        startCharOffset: Int,
+        endCharOffset: Int,
+        chapterTitle: String,
+        selectedText: String
+    ): Boolean
+    suspend fun deleteBookmark(bookmarkId: Long)
+    suspend fun saveHighlight(
+        bookId: String,
+        pageIndex: Int,
+        chapterIndex: Int,
+        startCharOffset: Int,
+        endCharOffset: Int,
+        chapterTitle: String,
+        selectedText: String,
+        color: HighlightColor
+    )
+    suspend fun clearHighlightsInRange(
+        bookId: String,
+        chapterIndex: Int,
+        startCharOffset: Int,
+        endCharOffset: Int
+    )
+    suspend fun deleteHighlight(highlightId: Long)
+}
+
+internal interface LibraryExternalContent {
+    fun isUriAccessible(uriString: String): Boolean
+    fun takePersistableReadPermission(uriString: String, originalUri: Uri?)
+    fun releasePersistableReadPermission(uriString: String)
+    fun queryDisplayName(uriString: String, originalUri: Uri?): String?
+    fun computeSha256AndHeader(uriString: String, originalUri: Uri?): Pair<String, ByteArray>
+    fun detectBookFormat(uriString: String, originalUri: Uri?, displayName: String?, headerBytes: ByteArray): BookFormat
+    fun buildBookEntity(bookId: String, uriString: String, originalUri: Uri?, fallbackTitle: String, format: BookFormat): BookEntity
+}
+
+class LibraryRepository internal constructor(
     private val context: Context,
     private val bookDao: BookDao,
     private val bookmarkDao: BookmarkDao,
-    private val highlightDao: HighlightDao
-) {
-    private val annotationMutex = Mutex()
+    private val highlightDao: HighlightDao,
+    private val externalContent: LibraryExternalContent
+) : ReaderBookRepository, LibraryShelfSource {
 
-    fun observeBooks(): Flow<List<Book>> = bookDao.observeAllBooks().map { entities ->
+    constructor(
+        context: Context,
+        bookDao: BookDao,
+        bookmarkDao: BookmarkDao,
+        highlightDao: HighlightDao
+    ) : this(
+        context = context,
+        bookDao = bookDao,
+        bookmarkDao = bookmarkDao,
+        highlightDao = highlightDao,
+        externalContent = AndroidLibraryExternalContent(context)
+    )
+
+    private val bookMutex = Mutex()
+    private val annotationMutex = Mutex()
+    private val deletedBookIds = HashSet<String>()
+
+    override fun observeBooks(): Flow<List<Book>> = bookDao.observeAllBooks().map { entities ->
         entities.map { entity ->
             entity.toDomain(isFileAccessible = isUriAccessible(entity.fileUri))
         }
@@ -57,7 +142,7 @@ class LibraryRepository(
         entity?.toDomain(isFileAccessible = isUriAccessible(entity.fileUri))
     }.flowOn(Dispatchers.IO)
 
-    suspend fun getBookById(bookId: String): Book? = withContext(Dispatchers.IO) {
+    override suspend fun getBookById(bookId: String): Book? = withContext(Dispatchers.IO) {
         val entity = bookDao.getBookById(bookId) ?: return@withContext null
         entity.toDomain(isFileAccessible = isUriAccessible(entity.fileUri))
     }
@@ -66,69 +151,96 @@ class LibraryRepository(
      * Links an external EPUB or PDF URI in-place via Storage Access Framework without duplicating
      * the ebook file into app internal storage.
      */
-    suspend fun linkExternalBook(uri: Uri): Result<Book> = withContext(Dispatchers.IO) {
-        runCatching {
-            takePersistableReadPermissionIfPossible(uri)
+    suspend fun linkExternalBook(uri: Uri): Result<Book> =
+        linkExternalBookUri(uri.toString(), uri)
 
-            val uriString = uri.toString()
-            bookDao.getBookByUri(uriString)?.let { existingByUri ->
-                if (isUriAccessible(uriString)) {
-                    return@runCatching existingByUri.toDomain(isFileAccessible = true)
+    override suspend fun linkExternalBookUri(uriString: String, originalUri: Uri?): Result<Book> =
+        withContext(Dispatchers.IO) {
+            runCatchingCancellable {
+                bookMutex.withLock {
+                    externalContent.takePersistableReadPermission(uriString, originalUri)
+
+                    bookDao.getBookByUri(uriString)?.let { existingByUri ->
+                        if (isUriAccessible(uriString)) {
+                            annotationMutex.withLock { deletedBookIds.remove(existingByUri.id) }
+                            return@withLock existingByUri.toDomain(isFileAccessible = true)
+                        }
+                    }
+
+                    val displayName = externalContent.queryDisplayName(uriString, originalUri)
+                    val fallbackTitle = displayName
+                        ?.substringBeforeLast('.')
+                        ?.replace('_', ' ')
+                        ?.trim()
+                        .takeUnless { it.isNullOrBlank() }
+                        ?: "Untitled Book"
+
+                    val (sha256Id, headerBytes) = externalContent.computeSha256AndHeader(uriString, originalUri)
+                    annotationMutex.withLock { deletedBookIds.remove(sha256Id) }
+
+                    // If this exact book content already exists on the shelf (e.g. file moved externally),
+                    // update its external URI reference while keeping all progress and bookmarks intact.
+                    val existingByHash = bookDao.getBookById(sha256Id)
+                    if (existingByHash != null) {
+                        bookDao.updateBookUri(sha256Id, uriString)
+                        val updated = bookDao.getBookById(sha256Id) ?: existingByHash.copy(fileUri = uriString)
+                        return@withLock updated.toDomain(isFileAccessible = true)
+                    }
+
+                    val format = externalContent.detectBookFormat(uriString, originalUri, displayName, headerBytes)
+                    val entity = externalContent.buildBookEntity(
+                        bookId = sha256Id,
+                        uriString = uriString,
+                        originalUri = originalUri,
+                        fallbackTitle = fallbackTitle,
+                        format = format
+                    )
+
+                    bookDao.upsertBook(entity)
+                    entity.toDomain(isFileAccessible = true)
                 }
             }
-
-            val displayName = queryDisplayName(uri)
-            val fallbackTitle = displayName
-                ?.substringBeforeLast('.')
-                ?.replace('_', ' ')
-                ?.trim()
-                .takeUnless { it.isNullOrBlank() }
-                ?: "Untitled Book"
-
-            val (sha256Id, headerBytes) = computeSha256AndHeader(uri)
-
-            // If this exact book content already exists on the shelf (e.g. file moved externally),
-            // update its external URI reference while keeping all progress and bookmarks intact.
-            val existingByHash = bookDao.getBookById(sha256Id)
-            if (existingByHash != null) {
-                bookDao.updateBookUri(sha256Id, uriString)
-                val updated = bookDao.getBookById(sha256Id) ?: existingByHash.copy(fileUri = uriString)
-                return@runCatching updated.toDomain(isFileAccessible = true)
-            }
-
-            val format = detectBookFormat(uri, displayName, headerBytes)
-            val entity = when (format) {
-                BookFormat.PDF -> buildPdfBookEntity(
-                    bookId = sha256Id,
-                    uri = uri,
-                    fallbackTitle = fallbackTitle
-                )
-                BookFormat.EPUB -> buildEpubBookEntity(
-                    bookId = sha256Id,
-                    uri = uri,
-                    fallbackTitle = fallbackTitle
-                )
-            }
-
-            bookDao.upsertBook(entity)
-            entity.toDomain(isFileAccessible = true)
         }
-    }
 
     /**
      * Re-binds a moved or renamed external file URI to an existing bookshelf entry,
      * preserving reading progress and bookmarks.
      */
-    suspend fun relinkBookUri(bookId: String, newUri: Uri): Result<Book> = withContext(Dispatchers.IO) {
-        runCatching {
-            takePersistableReadPermissionIfPossible(newUri)
-            if (!isUriAccessible(newUri.toString())) {
-                throw FileNotFoundException("Selected file cannot be read.")
+    suspend fun relinkBookUri(bookId: String, newUri: Uri): Result<Book> =
+        relinkBookUriString(bookId, newUri.toString(), newUri)
+
+    override suspend fun relinkBookUriString(
+        bookId: String,
+        newUriString: String,
+        originalUri: Uri?
+    ): Result<Book> = withContext(Dispatchers.IO) {
+        runCatchingCancellable {
+            bookMutex.withLock {
+                externalContent.takePersistableReadPermission(newUriString, originalUri)
+                if (!isUriAccessible(newUriString)) {
+                    throw FileNotFoundException("Selected file cannot be read.")
+                }
+                val existing = bookDao.getBookById(bookId)
+                    ?: throw IllegalStateException("Book record not found.")
+                val displayName = externalContent.queryDisplayName(newUriString, originalUri)
+                val (_, headerBytes) = externalContent.computeSha256AndHeader(newUriString, originalUri)
+                val incomingFormat = externalContent.detectBookFormat(
+                    uriString = newUriString,
+                    originalUri = originalUri,
+                    displayName = displayName,
+                    headerBytes = headerBytes
+                )
+                if (incomingFormat.name != existing.format) {
+                    throw IllegalArgumentException(
+                        "Please select a ${existing.format} file to re-link \"${existing.title}\"."
+                    )
+                }
+                annotationMutex.withLock { deletedBookIds.remove(bookId) }
+                bookDao.updateBookUri(bookId, newUriString)
+                val updated = bookDao.getBookById(bookId)
+                    ?: throw IllegalStateException("Book record not found.")
+                updated.toDomain(isFileAccessible = true)
             }
-            bookDao.updateBookUri(bookId, newUri.toString())
-            val updated = bookDao.getBookById(bookId)
-                ?: throw IllegalStateException("Book record not found.")
-            updated.toDomain(isFileAccessible = true)
         }
     }
 
@@ -136,25 +248,25 @@ class LibraryRepository(
      * Removes a book from the shelf non-destructively: deletes only local metadata & cached cover
      * thumbnail and releases the SAF URI permission, leaving the user's external file untouched.
      */
-    suspend fun removeBookFromShelf(book: Book) = withContext(Dispatchers.IO) {
-        runCatching {
-            context.contentResolver.releasePersistableUriPermission(
-                Uri.parse(book.fileUri),
-                Intent.FLAG_GRANT_READ_URI_PERMISSION
-            )
+    override suspend fun removeBookFromShelf(book: Book) = withContext(Dispatchers.IO) {
+        bookMutex.withLock {
+            annotationMutex.withLock {
+                deletedBookIds.add(book.id)
+                externalContent.releasePersistableReadPermission(book.fileUri)
+                book.coverPath?.let { path ->
+                    runCatching { File(path).delete() }
+                }
+                bookDao.deleteBookById(book.id)
+            }
         }
-        book.coverPath?.let { path ->
-            runCatching { File(path).delete() }
-        }
-        bookDao.deleteBookById(book.id)
     }
 
-    suspend fun saveReadingProgress(
+    override suspend fun saveReadingProgress(
         bookId: String,
         currentPage: Int,
         totalPages: Int,
-        epubChapterIndex: Int = 0,
-        epubCharOffset: Int = 0
+        epubChapterIndex: Int,
+        epubCharOffset: Int
     ) = withContext(Dispatchers.IO) {
         if (totalPages <= 0) return@withContext
         val clampedPage = currentPage.coerceIn(0, totalPages - 1)
@@ -170,17 +282,17 @@ class LibraryRepository(
         )
     }
 
-    fun observeBookmarks(bookId: String): Flow<List<Bookmark>> =
+    override fun observeBookmarks(bookId: String): Flow<List<Bookmark>> =
         bookmarkDao.observeBookmarksForBook(bookId).map { list ->
             list.map { it.toDomain() }
         }
 
-    fun observeHighlights(bookId: String): Flow<List<TextHighlight>> =
+    override fun observeHighlights(bookId: String): Flow<List<TextHighlight>> =
         highlightDao.observeHighlightsForBook(bookId).map { list ->
             list.map { it.toDomain() }
         }
 
-    suspend fun toggleBookmark(
+    override suspend fun toggleBookmark(
         bookId: String,
         pageIndex: Int,
         totalPages: Int,
@@ -190,6 +302,7 @@ class LibraryRepository(
         snippet: String
     ): Boolean = withContext(Dispatchers.IO) {
         annotationMutex.withLock {
+            if (bookId in deletedBookIds) return@withLock false
             val existing = bookmarkDao.getBookmarksForBook(bookId).firstOrNull { bm ->
                 bm.pageIndex == pageIndex && bm.epubEndCharOffset <= bm.epubCharOffset
             }
@@ -198,24 +311,28 @@ class LibraryRepository(
                 false
             } else {
                 val progress = ReadingProgressCalculator.computeProgress(pageIndex, totalPages)
-                bookmarkDao.insertBookmark(
-                    BookmarkEntity(
-                        bookId = bookId,
-                        pageIndex = pageIndex,
-                        epubChapterIndex = epubChapterIndex,
-                        epubCharOffset = epubCharOffset,
-                        epubEndCharOffset = epubCharOffset,
-                        progress = progress,
-                        chapterTitle = chapterTitle,
-                        snippet = snippet.ifBlank { "Page ${pageIndex + 1}" }
+                try {
+                    bookmarkDao.insertBookmark(
+                        BookmarkEntity(
+                            bookId = bookId,
+                            pageIndex = pageIndex,
+                            epubChapterIndex = epubChapterIndex,
+                            epubCharOffset = epubCharOffset,
+                            epubEndCharOffset = epubCharOffset,
+                            progress = progress,
+                            chapterTitle = chapterTitle,
+                            snippet = snippet.ifBlank { "Page ${pageIndex + 1}" }
+                        )
                     )
-                )
-                true
+                    true
+                } catch (t: Throwable) {
+                    if (t.isForeignKeyConstraint()) false else throw t
+                }
             }
         }
     }
 
-    suspend fun toggleSelectionBookmark(
+    override suspend fun toggleSelectionBookmark(
         bookId: String,
         pageIndex: Int,
         totalPages: Int,
@@ -226,6 +343,7 @@ class LibraryRepository(
         selectedText: String
     ): Boolean = withContext(Dispatchers.IO) {
         annotationMutex.withLock {
+            if (bookId in deletedBookIds) return@withLock false
             val safeEnd = maxOf(startCharOffset + 1, endCharOffset)
             val existing = bookmarkDao.getBookmarksForBook(bookId).firstOrNull { bm ->
                 bm.epubChapterIndex == chapterIndex &&
@@ -238,30 +356,34 @@ class LibraryRepository(
                 false
             } else {
                 val progress = ReadingProgressCalculator.computeProgress(pageIndex, totalPages)
-                bookmarkDao.insertBookmark(
-                    BookmarkEntity(
-                        bookId = bookId,
-                        pageIndex = pageIndex,
-                        epubChapterIndex = chapterIndex,
-                        epubCharOffset = startCharOffset,
-                        epubEndCharOffset = safeEnd,
-                        progress = progress,
-                        chapterTitle = chapterTitle,
-                        snippet = selectedText.trim().take(600)
+                try {
+                    bookmarkDao.insertBookmark(
+                        BookmarkEntity(
+                            bookId = bookId,
+                            pageIndex = pageIndex,
+                            epubChapterIndex = chapterIndex,
+                            epubCharOffset = startCharOffset,
+                            epubEndCharOffset = safeEnd,
+                            progress = progress,
+                            chapterTitle = chapterTitle,
+                            snippet = selectedText.trim().take(600)
+                        )
                     )
-                )
-                true
+                    true
+                } catch (t: Throwable) {
+                    if (t.isForeignKeyConstraint()) false else throw t
+                }
             }
         }
     }
 
-    suspend fun deleteBookmark(bookmarkId: Long) = withContext(Dispatchers.IO) {
+    override suspend fun deleteBookmark(bookmarkId: Long) = withContext(Dispatchers.IO) {
         annotationMutex.withLock {
             bookmarkDao.deleteBookmarkById(bookmarkId)
         }
     }
 
-    suspend fun saveHighlight(
+    override suspend fun saveHighlight(
         bookId: String,
         pageIndex: Int,
         chapterIndex: Int,
@@ -270,31 +392,51 @@ class LibraryRepository(
         chapterTitle: String,
         selectedText: String,
         color: HighlightColor
-    ) = withContext(Dispatchers.IO) {
-        if (endCharOffset <= startCharOffset) return@withContext
-        annotationMutex.withLock {
-            highlightDao.deleteOverlappingHighlights(
-                bookId = bookId,
-                chapterIndex = chapterIndex,
-                startOffset = startCharOffset,
-                endOffset = endCharOffset
-            )
-            highlightDao.insertHighlight(
-                HighlightEntity(
+    ) {
+        withContext(Dispatchers.IO) {
+            if (endCharOffset <= startCharOffset) return@withContext
+            annotationMutex.withLock {
+                if (bookId in deletedBookIds) return@withLock
+                highlightDao.deleteOverlappingHighlights(
                     bookId = bookId,
-                    pageIndex = pageIndex,
                     chapterIndex = chapterIndex,
-                    startCharOffset = startCharOffset,
-                    endCharOffset = endCharOffset,
-                    chapterTitle = chapterTitle,
-                    selectedText = selectedText.trim().take(600),
-                    colorName = color.name
+                    startOffset = startCharOffset,
+                    endOffset = endCharOffset
                 )
-            )
+                try {
+                    highlightDao.insertHighlight(
+                        HighlightEntity(
+                            bookId = bookId,
+                            pageIndex = pageIndex,
+                            chapterIndex = chapterIndex,
+                            startCharOffset = startCharOffset,
+                            endCharOffset = endCharOffset,
+                            chapterTitle = chapterTitle,
+                            selectedText = selectedText.trim().take(600),
+                            colorName = color.name
+                        )
+                    )
+                } catch (t: Throwable) {
+                    if (!t.isForeignKeyConstraint()) throw t
+                }
+            }
         }
     }
 
-    suspend fun clearHighlightsInRange(
+    private fun Throwable.isForeignKeyConstraint(): Boolean {
+        var cur: Throwable? = this
+        while (cur != null) {
+            if (cur::class.java.simpleName == "SQLiteConstraintException" ||
+                cur.message.orEmpty().contains("FOREIGN KEY", ignoreCase = true)
+            ) {
+                return true
+            }
+            cur = cur.cause
+        }
+        return false
+    }
+
+    override suspend fun clearHighlightsInRange(
         bookId: String,
         chapterIndex: Int,
         startCharOffset: Int,
@@ -310,25 +452,71 @@ class LibraryRepository(
         }
     }
 
-    suspend fun deleteHighlight(highlightId: Long) = withContext(Dispatchers.IO) {
+    override suspend fun deleteHighlight(highlightId: Long) = withContext(Dispatchers.IO) {
         annotationMutex.withLock {
             highlightDao.deleteHighlightById(highlightId)
         }
     }
 
-    fun isUriAccessible(uriString: String): Boolean {
+    fun isUriAccessible(uriString: String): Boolean = externalContent.isUriAccessible(uriString)
+}
+
+private class AndroidLibraryExternalContent(
+    private val context: Context
+) : LibraryExternalContent {
+
+    private fun resolveUri(uriString: String, originalUri: Uri?): Uri =
+        originalUri ?: Uri.parse(uriString)
+
+    override fun isUriAccessible(uriString: String): Boolean {
         return runCatching {
             val uri = Uri.parse(uriString)
             context.contentResolver.openFileDescriptor(uri, "r")?.use { true } ?: false
         }.getOrDefault(false)
     }
 
-    private fun takePersistableReadPermissionIfPossible(uri: Uri) {
+    override fun takePersistableReadPermission(uriString: String, originalUri: Uri?) {
         runCatching {
             context.contentResolver.takePersistableUriPermission(
-                uri,
+                resolveUri(uriString, originalUri),
                 Intent.FLAG_GRANT_READ_URI_PERMISSION
             )
+        }
+    }
+
+    override fun releasePersistableReadPermission(uriString: String) {
+        runCatching {
+            context.contentResolver.releasePersistableUriPermission(
+                Uri.parse(uriString),
+                Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+    }
+
+    override fun queryDisplayName(uriString: String, originalUri: Uri?): String? =
+        queryDisplayName(resolveUri(uriString, originalUri))
+
+    override fun computeSha256AndHeader(uriString: String, originalUri: Uri?): Pair<String, ByteArray> =
+        computeSha256AndHeader(resolveUri(uriString, originalUri))
+
+    override fun detectBookFormat(
+        uriString: String,
+        originalUri: Uri?,
+        displayName: String?,
+        headerBytes: ByteArray
+    ): BookFormat = detectBookFormat(resolveUri(uriString, originalUri), displayName, headerBytes)
+
+    override fun buildBookEntity(
+        bookId: String,
+        uriString: String,
+        originalUri: Uri?,
+        fallbackTitle: String,
+        format: BookFormat
+    ): BookEntity {
+        val uri = resolveUri(uriString, originalUri)
+        return when (format) {
+            BookFormat.PDF -> buildPdfBookEntity(bookId = bookId, uri = uri, fallbackTitle = fallbackTitle)
+            BookFormat.EPUB -> buildEpubBookEntity(bookId = bookId, uri = uri, fallbackTitle = fallbackTitle)
         }
     }
 

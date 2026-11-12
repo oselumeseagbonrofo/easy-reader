@@ -111,4 +111,42 @@ object PdfZoomGestureHelper {
         if (hasMovedPastSlop) return false
         return true
     }
+
+    internal fun shouldResetZoomOnSettledPage(
+        settledPage: Int,
+        currentPage: Int
+    ): Boolean = settledPage != currentPage
+
+    internal fun reconcileLayoutEffect(
+        currentState: ZoomPanState,
+        isActivePage: Boolean
+    ): Pair<ZoomPanState, Boolean> {
+        if (!isActivePage) {
+            val wasZoomed = currentState.isZoomed || currentState.scale > ZOOM_THRESHOLD
+            val resetState = if (wasZoomed || currentState.scale != 1f || currentState.offsetX != 0f || currentState.offsetY != 0f) {
+                ZoomPanState(scale = 1f, offsetX = 0f, offsetY = 0f, isZoomed = false)
+            } else {
+                currentState
+            }
+            return resetState to wasZoomed
+        }
+        return if (currentState.scale > ZOOM_THRESHOLD || currentState.isZoomed) {
+            currentState to false
+        } else {
+            currentState.copy(offsetY = 0f) to false
+        }
+    }
+
+    internal fun canApplyAsyncSelection(
+        isActivePage: Boolean,
+        isGestureInProgress: Boolean
+    ): Boolean = isActivePage && !isGestureInProgress
+
+    internal fun isPdfPagerScrollEnabled(
+        activePageZoomed: Boolean,
+        activeSelectionPage: Int?,
+        currentPage: Int
+    ): Boolean = !activePageZoomed && activeSelectionPage != currentPage
+
+    internal fun shouldRecycleDisposedZoomTileBitmap(): Boolean = false
 }

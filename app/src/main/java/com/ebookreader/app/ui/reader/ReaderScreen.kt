@@ -60,10 +60,14 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.ebookreader.app.domain.model.BookFormat
 import com.ebookreader.app.ui.theme.ReaderPalette
 import com.ebookreader.app.ui.theme.readerPaletteFor
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 @Composable
 fun ReaderScreen(
@@ -75,6 +79,9 @@ fun ReaderScreen(
     val snackbarHostState = remember { SnackbarHostState() }
 
     var isHudVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(uiState.isSearchVisible) {
+        if (uiState.isSearchVisible) isHudVisible = false
+    }
     var activeSheet by remember { mutableStateOf<ReaderModalSheet?>(null) }
     var tocSheetInitialTab by remember { mutableIntStateOf(0) }
 
@@ -161,22 +168,21 @@ fun ReaderScreen(
                         viewModel.effects.collect { effect ->
                             when (effect) {
                                 is ReaderEffect.ScrollToPage -> {
-                                    val expectedTotal = viewModel.uiState.value.totalPages.coerceAtLeast(1)
-                                    val desired = effect.pageIndex.coerceIn(0, expectedTotal - 1)
-                                    if (pagerState.pageCount <= desired) {
-                                        snapshotFlow { pagerState.pageCount }
-                                            .first { it > desired || it >= expectedTotal }
-                                    }
-                                    val maxPage = (pagerState.pageCount - 1).coerceAtLeast(0)
-                                    val target = desired.coerceIn(0, maxPage)
-                                    if (pagerState.currentPage != target) {
-                                        if (effect.animate) {
-                                            pagerState.animateScrollToPage(target)
-                                        } else {
-                                            pagerState.scrollToPage(target)
-                                        }
-                                    }
-                                    viewModel.onScrollEffectApplied(target)
+                                    applyScrollToPageEffect(
+                                        effect = effect,
+                                        liveTotalPages = { viewModel.uiState.value.totalPages },
+                                        livePagerPageCount = { pagerState.pageCount },
+                                        pageCountFlow = snapshotFlow { pagerState.pageCount },
+                                        livePagerCurrentPage = { pagerState.currentPage },
+                                        performScroll = { target, animate ->
+                                            if (animate) {
+                                                pagerState.animateScrollToPage(target)
+                                            } else {
+                                                pagerState.scrollToPage(target)
+                                            }
+                                        },
+                                        onApplied = viewModel::onScrollEffectApplied
+                                    )
                                 }
 
                                 is ReaderEffect.ShowSnackbar -> {
@@ -250,10 +256,14 @@ fun ReaderScreen(
                                             if (active) isHudVisible = false
                                         },
                                         onToggleHud = {
-                                            if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
-                                                viewModel.setSearchResultsExpanded(false)
-                                            } else {
-                                                isHudVisible = !isHudVisible
+                                            val (nextHud, nextExpanded) = nextHudStateOnContentTap(
+                                                isHudVisible = isHudVisible,
+                                                isSearchVisible = uiState.isSearchVisible,
+                                                isSearchResultsExpanded = uiState.isSearchResultsExpanded
+                                            )
+                                            isHudVisible = nextHud
+                                            if (nextExpanded != uiState.isSearchResultsExpanded) {
+                                                viewModel.setSearchResultsExpanded(nextExpanded)
                                             }
                                         }
                                     )
@@ -275,10 +285,14 @@ fun ReaderScreen(
                                         if (active) isHudVisible = false
                                     },
                                     onToggleHud = {
-                                        if (uiState.isSearchVisible && uiState.isSearchResultsExpanded) {
-                                            viewModel.setSearchResultsExpanded(false)
-                                        } else {
-                                            isHudVisible = !isHudVisible
+                                        val (nextHud, nextExpanded) = nextHudStateOnContentTap(
+                                            isHudVisible = isHudVisible,
+                                            isSearchVisible = uiState.isSearchVisible,
+                                            isSearchResultsExpanded = uiState.isSearchResultsExpanded
+                                        )
+                                        isHudVisible = nextHud
+                                        if (nextExpanded != uiState.isSearchResultsExpanded) {
+                                            viewModel.setSearchResultsExpanded(nextExpanded)
                                         }
                                     }
                                 )
@@ -343,7 +357,7 @@ fun ReaderScreen(
                 }
 
                 InteractiveProgressScrubberHud(
-                    visible = isHudVisible,
+                    visible = isBottomScrubberVisible(isHudVisible, uiState.isSearchVisible),
                     currentPage = uiState.currentPage,
                     totalPages = uiState.totalPages,
                     chapterTitleForPage = { pageIdx ->
@@ -386,7 +400,7 @@ fun ReaderScreen(
                 highlights = uiState.highlights,
                 currentPage = uiState.currentPage,
                 onSelectTocEntry = { entry ->
-                    viewModel.jumpToPage(entry.pageIndex, recordReturnPoint = true, animate = false)
+                    viewModel.jumpToTocEntry(entry)
                 },
                 onSelectBookmark = { bm ->
                     viewModel.jumpToBookmark(bm)
@@ -523,4 +537,59 @@ private fun ReaderTopHudBar(
             }
         }
     }
+}
+
+internal fun isBottomScrubberVisible(isHudVisible: Boolean, isSearchVisible: Boolean): Boolean =
+    isHudVisible && !isSearchVisible
+
+internal fun nextHudStateOnContentTap(
+    isHudVisible: Boolean,
+    isSearchVisible: Boolean,
+    isSearchResultsExpanded: Boolean
+): Pair<Boolean, Boolean> {
+    return if (isSearchVisible) {
+        false to false
+    } else {
+        !isHudVisible to isSearchResultsExpanded
+    }
+}
+
+internal suspend fun applyScrollToPageEffect(
+    effect: ReaderEffect.ScrollToPage,
+    liveTotalPages: () -> Int,
+    livePagerPageCount: () -> Int,
+    pageCountFlow: kotlinx.coroutines.flow.Flow<Int>,
+    livePagerCurrentPage: () -> Int,
+    performScroll: suspend (targetPage: Int, animate: Boolean) -> Unit,
+    onApplied: (Int) -> Unit
+) {
+    val initialExpected = liveTotalPages().coerceAtLeast(1)
+    if (livePagerPageCount() <= effect.pageIndex.coerceIn(0, initialExpected - 1)) {
+        val deadlineNs = System.nanoTime() + 1_500_000_000L
+        while (true) {
+            val expectedTotal = liveTotalPages().coerceAtLeast(1)
+            val desired = effect.pageIndex.coerceIn(0, expectedTotal - 1)
+            val currentCount = livePagerPageCount()
+            if (currentCount > desired || expectedTotal <= currentCount) break
+            val remainingMs = (deadlineNs - System.nanoTime()) / 1_000_000L
+            if (remainingMs <= 0L) break
+            withTimeoutOrNull(minOf(30L, remainingMs)) {
+                pageCountFlow.first { count ->
+                    val latestTotal = liveTotalPages().coerceAtLeast(1)
+                    count > effect.pageIndex.coerceIn(0, latestTotal - 1) || latestTotal <= count
+                }
+            }
+        }
+    }
+    val maxPage = (livePagerPageCount() - 1).coerceAtLeast(0)
+    val target = effect.pageIndex.coerceIn(0, maxPage)
+    if (livePagerCurrentPage() != target) {
+        try {
+            performScroll(target, effect.animate)
+        } catch (ce: CancellationException) {
+            currentCoroutineContext().ensureActive()
+            // Gesture interruption or superseded animation while collector stays alive: release pending target.
+        }
+    }
+    onApplied(target)
 }

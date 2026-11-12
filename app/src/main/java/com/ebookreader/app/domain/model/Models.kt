@@ -1,6 +1,15 @@
 package com.ebookreader.app.domain.model
 
+import kotlinx.coroutines.CancellationException
 import kotlin.math.roundToInt
+
+internal inline fun <T> runCatchingCancellable(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (ce: CancellationException) {
+    throw ce
+} catch (t: Throwable) {
+    Result.failure(t)
+}
 
 enum class BookFormat {
     EPUB,

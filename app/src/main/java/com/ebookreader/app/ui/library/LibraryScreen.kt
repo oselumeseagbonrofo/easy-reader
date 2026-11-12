@@ -65,6 +65,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -101,9 +102,15 @@ fun LibraryScreen(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
 
-    var bookToRemove by remember { mutableStateOf<Book?>(null) }
-    var bookToRelink by remember { mutableStateOf<Book?>(null) }
-    var isSearchExpanded by remember { mutableStateOf(false) }
+    var bookToRemoveId by rememberSaveable { mutableStateOf<String?>(null) }
+    var bookToRelinkId by rememberSaveable { mutableStateOf<String?>(null) }
+    val bookToRemove = remember(uiState.allBooks, bookToRemoveId) {
+        bookToRemoveId?.let { id -> uiState.allBooks.firstOrNull { it.id == id } }
+    }
+    val bookToRelink = remember(uiState.allBooks, bookToRelinkId) {
+        bookToRelinkId?.let { id -> uiState.allBooks.firstOrNull { it.id == id } }
+    }
+    var isSearchExpanded by rememberSaveable { mutableStateOf(false) }
 
     val importBookLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -116,10 +123,10 @@ fun LibraryScreen(
     val relinkBookLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
-        val pending = bookToRelink
-        bookToRelink = null
-        if (uri != null && pending != null) {
-            viewModel.relinkMissingBook(pending.id, uri)
+        val pendingId = bookToRelinkId
+        bookToRelinkId = null
+        if (uri != null && pendingId != null) {
+            viewModel.relinkMissingBook(pendingId, uri)
         }
     }
 
@@ -127,7 +134,7 @@ fun LibraryScreen(
         viewModel.events.collect { event ->
             when (event) {
                 is LibraryEvent.ShowMessage -> snackbarHostState.showSnackbar(event.message)
-                is LibraryEvent.OpenBook -> onOpenBook(event.bookId)
+                is LibraryEvent.OpenBook -> Unit
             }
         }
     }
@@ -284,10 +291,10 @@ fun LibraryScreen(
                                     if (book.isFileAccessible) {
                                         onOpenBook(book.id)
                                     } else {
-                                        bookToRelink = book
+                                        bookToRelinkId = book.id
                                     }
                                 },
-                                onMenuClick = { bookToRemove = book }
+                                onMenuClick = { bookToRemoveId = book.id }
                             )
                         }
                     }
@@ -298,7 +305,7 @@ fun LibraryScreen(
 
     bookToRemove?.let { target ->
         AlertDialog(
-            onDismissRequest = { bookToRemove = null },
+            onDismissRequest = { bookToRemoveId = null },
             title = { Text("Remove from Bookshelf?") },
             text = {
                 Text(
@@ -310,7 +317,7 @@ fun LibraryScreen(
                 TextButton(
                     onClick = {
                         viewModel.removeBookFromShelf(target)
-                        bookToRemove = null
+                        bookToRemoveId = null
                     }
                 ) {
                     Icon(
@@ -323,7 +330,7 @@ fun LibraryScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { bookToRemove = null }) {
+                TextButton(onClick = { bookToRemoveId = null }) {
                     Text("Cancel")
                 }
             }
@@ -332,7 +339,7 @@ fun LibraryScreen(
 
     bookToRelink?.let { missing ->
         AlertDialog(
-            onDismissRequest = { bookToRelink = null },
+            onDismissRequest = { bookToRelinkId = null },
             icon = { Icon(Icons.Default.LinkOff, contentDescription = null) },
             title = { Text("External File Moved") },
             text = {
@@ -350,8 +357,8 @@ fun LibraryScreen(
             },
             dismissButton = {
                 TextButton(onClick = {
-                    bookToRemove = missing
-                    bookToRelink = null
+                    bookToRemoveId = missing.id
+                    bookToRelinkId = null
                 }) {
                     Text("Remove")
                 }

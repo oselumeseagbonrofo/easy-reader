@@ -12,6 +12,7 @@ import android.os.ParcelFileDescriptor
 import android.util.LruCache
 import com.ebookreader.app.domain.model.PdfFitMode
 import com.ebookreader.app.domain.model.TocEntry
+import com.ebookreader.app.domain.model.runCatchingCancellable
 import com.tom_roush.pdfbox.io.MemoryUsageSetting
 import com.tom_roush.pdfbox.io.RandomAccessRead
 import com.tom_roush.pdfbox.io.ScratchFile
@@ -21,6 +22,8 @@ import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOut
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineNode
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -69,23 +72,118 @@ data class PdfDisplayRect(
     }
 }
 
+internal interface PdfDocumentAccess {
+    val pageCount: Int
+    suspend fun <T> withPdfBoxDocument(block: suspend (PDDocument) -> T): T?
+    suspend fun <T> withPage(pageIndex: Int, block: (PdfRenderer.Page) -> T): T
+}
+
+/**
+ * Coordinates lifecycle, mutexes, and close semantics between render/PdfBox sessions.
+ */
+internal class PdfSessionLifecycle<D : Any>(
+    private val renderMutex: Mutex = Mutex(),
+    private val docMutex: Mutex = Mutex(),
+    private val openDoc: () -> D?,
+    private val closeDoc: (D) -> Unit,
+    private val onCloseTransport: () -> Unit
+) {
+    @Volatile
+    var isClosed: Boolean = false
+        private set
+
+    @Volatile
+    private var cachedDoc: D? = null
+
+    suspend fun <T> withRenderLock(block: suspend () -> T): T {
+        return renderMutex.withLock {
+            check(!isClosed) { "PdfDocumentController is closed" }
+            block()
+        }
+    }
+
+    suspend fun <T> withDoc(block: suspend (D) -> T): T? {
+        return docMutex.withLock {
+            if (isClosed) return@withLock null
+            val doc = cachedDoc ?: runCatchingCancellable { openDoc() }.getOrNull()?.also { opened ->
+                if (isClosed) {
+                    runCatching { closeDoc(opened) }
+                    return@withLock null
+                }
+                cachedDoc = opened
+            } ?: return@withLock null
+            runCatchingCancellable { block(doc) }.getOrNull()
+        }
+    }
+
+    fun close() {
+        isClosed = true
+        runBlocking {
+            withContext(NonCancellable) {
+                renderMutex.withLock {
+                    docMutex.withLock {
+                        val doc = cachedDoc
+                        cachedDoc = null
+                        if (doc != null) {
+                            runCatching { closeDoc(doc) }
+                        }
+                        onCloseTransport()
+                    }
+                }
+            }
+        }
+    }
+}
+
 class PdfDocumentController private constructor(
     private val context: Context,
     val uri: Uri,
     private val parcelFileDescriptor: ParcelFileDescriptor,
     private val pdfRenderer: PdfRenderer
-) : Closeable {
+) : Closeable, PdfDocumentAccess {
 
     private val renderMutex = Mutex()
     private val pdfBoxMutex = Mutex()
 
-    @Volatile
-    private var isClosed = false
+    private val isClosed: Boolean
+        get() = lifecycle.isClosed
     private var pdfBoxRandomAccess: Closeable? = null
     private var pdfBoxStream: InputStream? = null
     private var cachedPdDocument: PDDocument? = null
 
-    val pageCount: Int
+    private val lifecycle = PdfSessionLifecycle<PDDocument>(
+        renderMutex = renderMutex,
+        docMutex = pdfBoxMutex,
+        openDoc = {
+            runCatching {
+                if (!com.tom_roush.pdfbox.android.PDFBoxResourceLoader.isReady()) {
+                    com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context.applicationContext)
+                }
+            }
+            openZeroCopyPdDocument(context, uri)?.also { (loaded, source) ->
+                pdfBoxRandomAccess = source
+                cachedPdDocument = loaded
+            }?.first ?: run {
+                val stream = context.contentResolver.openInputStream(uri) ?: return@run null
+                PDDocument.load(stream, MemoryUsageSetting.setupTempFileOnly()).also { loaded ->
+                    pdfBoxStream = stream
+                    cachedPdDocument = loaded
+                }
+            }
+        },
+        closeDoc = { doc -> doc.close() },
+        onCloseTransport = {
+            cachedPdDocument = null
+            runCatching { pdfBoxRandomAccess?.close() }
+            pdfBoxRandomAccess = null
+            runCatching { pdfBoxStream?.close() }
+            pdfBoxStream = null
+            runCatching { pdfRenderer.close() }
+            runCatching { parcelFileDescriptor.close() }
+        }
+    )
+
+    override val pageCount: Int
         get() = if (isClosed) 0 else pdfRenderer.pageCount
 
     private val bitmapCache: LruCache<String, Bitmap> by lazy {
@@ -109,7 +207,7 @@ class PdfDocumentController private constructor(
             ?.let { return@withContext it }
 
         val nativeLayout = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-            runCatching {
+            runCatchingCancellable {
                 withPage(pageIndex) { page ->
                     PdfSearchEngine.extractPageTextLayoutNativeApi35(page, pageIndex)
                 }
@@ -155,10 +253,9 @@ class PdfDocumentController private constructor(
     fun getContentBounds(pageIndex: Int): PdfContentBounds =
         synchronized(boundsCache) { boundsCache.get(pageIndex) } ?: PdfContentBounds.FULL
 
-    suspend fun <T> withPage(pageIndex: Int, block: (PdfRenderer.Page) -> T): T {
+    override suspend fun <T> withPage(pageIndex: Int, block: (PdfRenderer.Page) -> T): T {
         return withContext(Dispatchers.IO) {
-            renderMutex.withLock {
-                check(!isClosed) { "PdfDocumentController is closed" }
+            lifecycle.withRenderLock {
                 val safeIndex = pageIndex.coerceIn(0, (pdfRenderer.pageCount - 1).coerceAtLeast(0))
                 pdfRenderer.openPage(safeIndex).use { page ->
                     block(page)
@@ -171,29 +268,9 @@ class PdfDocumentController private constructor(
      * Serializes PdfBox access across a single temp-file-backed [PDDocument] so rapid
      * bookmarking, outline loading, or search never allocates parallel heap copies of the PDF.
      */
-    suspend fun <T> withPdfBoxDocument(block: suspend (PDDocument) -> T): T? =
+    override suspend fun <T> withPdfBoxDocument(block: suspend (PDDocument) -> T): T? =
         withContext(Dispatchers.IO) {
-            pdfBoxMutex.withLock {
-                if (isClosed) return@withLock null
-                runCatching {
-                    if (!com.tom_roush.pdfbox.android.PDFBoxResourceLoader.isReady()) {
-                        com.tom_roush.pdfbox.android.PDFBoxResourceLoader.init(context.applicationContext)
-                    }
-                }
-                val doc = cachedPdDocument ?: runCatching {
-                    openZeroCopyPdDocument(context, uri)?.also { (loaded, source) ->
-                        pdfBoxRandomAccess = source
-                        cachedPdDocument = loaded
-                    }?.first ?: run {
-                        val stream = context.contentResolver.openInputStream(uri) ?: return@runCatching null
-                        PDDocument.load(stream, MemoryUsageSetting.setupTempFileOnly()).also { loaded ->
-                            pdfBoxStream = stream
-                            cachedPdDocument = loaded
-                        }
-                    }
-                }.getOrNull() ?: return@withLock null
-                runCatching { block(doc) }.getOrNull()
-            }
+            lifecycle.withDoc(block)
         }
 
     /**
@@ -214,7 +291,7 @@ class PdfDocumentController private constructor(
             bitmapCache.get(cacheKey)?.takeIf { !it.isRecycled }?.let { return it }
         }
 
-        return runCatching {
+        return runCatchingCancellable {
             withPage(pageIndex) { page ->
                 val aspectRatio = if (page.width > 0) {
                     page.height.toFloat() / page.width.toFloat()
@@ -265,7 +342,7 @@ class PdfDocumentController private constructor(
         if (isClosed || pageCount <= 0 || pageIndex !in 0 until pageCount) return null
         if (viewportWidthPx <= 0 || viewportHeightPx <= 0 || fitWidth <= 0f || fitHeight <= 0f) return null
 
-        return runCatching {
+        return runCatchingCancellable {
             withPage(pageIndex) { page ->
                 val transform = computeTileTransform(
                     pageWidthPts = page.width.coerceAtLeast(1),
@@ -350,7 +427,7 @@ class PdfDocumentController private constructor(
         synchronized(snippetCache) { snippetCache.get(pageIndex) }?.let { return@withContext it }
 
         val nativeText = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-            runCatching {
+            runCatchingCancellable {
                 withPage(pageIndex) { page ->
                     page.textContents.joinToString(" ") { it.text }
                 }.replace(Regex("\\s+"), " ").trim().take(140)
@@ -382,19 +459,11 @@ class PdfDocumentController private constructor(
     }
 
     override fun close() {
-        isClosed = true
+        lifecycle.close()
         synchronized(bitmapCache) { bitmapCache.evictAll() }
         synchronized(boundsCache) { boundsCache.evictAll() }
         synchronized(snippetCache) { snippetCache.evictAll() }
         synchronized(textLayoutCache) { textLayoutCache.evictAll() }
-        runCatching { cachedPdDocument?.close() }
-        cachedPdDocument = null
-        runCatching { pdfBoxRandomAccess?.close() }
-        pdfBoxRandomAccess = null
-        runCatching { pdfBoxStream?.close() }
-        pdfBoxStream = null
-        runCatching { pdfRenderer.close() }
-        runCatching { parcelFileDescriptor.close() }
         purgeStalePdfBoxTempFiles(context.cacheDir)
     }
 

@@ -5,14 +5,16 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.ebookreader.app.data.repository.LibraryRepository
+import com.ebookreader.app.data.repository.LibraryShelfSource
 import com.ebookreader.app.domain.model.Book
 import com.ebookreader.app.domain.model.BookFormat
-import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
@@ -38,16 +40,22 @@ sealed interface LibraryEvent {
     data class OpenBook(val bookId: String) : LibraryEvent
 }
 
-class LibraryViewModel(
-    private val libraryRepository: LibraryRepository
+class LibraryViewModel internal constructor(
+    private val libraryRepository: LibraryShelfSource
 ) : ViewModel() {
+
+    constructor(libraryRepository: LibraryRepository) : this(libraryRepository as LibraryShelfSource)
 
     private val selectedFilter = MutableStateFlow(BookshelfFilter.ALL)
     private val searchQuery = MutableStateFlow("")
+    private var activeImportsCount = 0
     private val isImporting = MutableStateFlow(false)
 
-    private val _events = MutableSharedFlow<LibraryEvent>()
-    val events = _events.asSharedFlow()
+    private val _events = Channel<LibraryEvent>(Channel.BUFFERED)
+    val events: Flow<LibraryEvent> = _events.receiveAsFlow()
+
+    private val _openBookEvents = Channel<LibraryEvent.OpenBook>(Channel.BUFFERED)
+    val openBookEvents: Flow<LibraryEvent.OpenBook> = _openBookEvents.receiveAsFlow()
 
     val uiState: StateFlow<LibraryUiState> = combine(
         libraryRepository.observeBooks(),
@@ -97,34 +105,51 @@ class LibraryViewModel(
     }
 
     fun importExternalBook(uri: Uri, openImmediately: Boolean = false) {
+        importExternalBookUri(uri.toString(), openImmediately = openImmediately, originalUri = uri)
+    }
+
+    internal fun importExternalBookUri(
+        uriString: String,
+        openImmediately: Boolean = false,
+        originalUri: Uri? = null
+    ) {
         viewModelScope.launch {
+            activeImportsCount++
             isImporting.value = true
-            val result = libraryRepository.linkExternalBook(uri)
-            isImporting.value = false
-            result.onSuccess { book ->
-                if (openImmediately) {
-                    _events.emit(LibraryEvent.OpenBook(book.id))
-                } else {
-                    _events.emit(LibraryEvent.ShowMessage("Added \"${book.title}\""))
-                }
-            }.onFailure { err ->
-                _events.emit(
-                    LibraryEvent.ShowMessage(
-                        err.message ?: "Could not open the selected ebook file."
+            try {
+                val result = libraryRepository.linkExternalBookUri(uriString, originalUri)
+                result.onSuccess { book ->
+                    if (openImmediately) {
+                        _openBookEvents.send(LibraryEvent.OpenBook(book.id))
+                    } else {
+                        _events.send(LibraryEvent.ShowMessage("Added \"${book.title}\""))
+                    }
+                }.onFailure { err ->
+                    _events.send(
+                        LibraryEvent.ShowMessage(
+                            err.message ?: "Could not open the selected ebook file."
+                        )
                     )
-                )
+                }
+            } finally {
+                activeImportsCount = (activeImportsCount - 1).coerceAtLeast(0)
+                isImporting.value = activeImportsCount > 0
             }
         }
     }
 
     fun relinkMissingBook(bookId: String, newUri: Uri) {
+        relinkMissingBookUri(bookId, newUri.toString(), newUri)
+    }
+
+    internal fun relinkMissingBookUri(bookId: String, newUriString: String, originalUri: Uri? = null) {
         viewModelScope.launch {
-            libraryRepository.relinkBookUri(bookId, newUri)
+            libraryRepository.relinkBookUriString(bookId, newUriString, originalUri)
                 .onSuccess { book ->
-                    _events.emit(LibraryEvent.ShowMessage("Re-linked \"${book.title}\""))
+                    _events.send(LibraryEvent.ShowMessage("Re-linked \"${book.title}\""))
                 }
                 .onFailure { err ->
-                    _events.emit(
+                    _events.send(
                         LibraryEvent.ShowMessage(err.message ?: "Failed to re-link file.")
                     )
                 }
@@ -134,7 +159,7 @@ class LibraryViewModel(
     fun removeBookFromShelf(book: Book) {
         viewModelScope.launch {
             libraryRepository.removeBookFromShelf(book)
-            _events.emit(LibraryEvent.ShowMessage("Removed \"${book.title}\" from shelf"))
+            _events.send(LibraryEvent.ShowMessage("Removed \"${book.title}\" from shelf"))
         }
     }
 

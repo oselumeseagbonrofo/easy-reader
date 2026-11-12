@@ -8,6 +8,7 @@ import android.os.Build
 import androidx.annotation.RequiresApi
 import com.ebookreader.app.domain.model.NormalizedRect
 import com.ebookreader.app.domain.model.SearchMatch
+import com.ebookreader.app.domain.model.runCatchingCancellable
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.text.PDFTextStripper
 import com.tom_roush.pdfbox.text.TextPosition
@@ -553,25 +554,42 @@ object PdfSearchEngine {
         controller: PdfDocumentController,
         rawQuery: String,
         maxResults: Int = 300
+    ): List<SearchMatch> = searchWithAccess(
+        controller = controller,
+        rawQuery = rawQuery,
+        maxResults = maxResults,
+        supportsNativeApi35 = Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM
+    )
+
+    internal suspend fun searchWithAccess(
+        controller: PdfDocumentAccess,
+        rawQuery: String,
+        maxResults: Int = 300,
+        supportsNativeApi35: Boolean = false,
+        nativeApi35Runner: (suspend (PdfDocumentAccess, String, Int) -> List<SearchMatch>)? = null
     ): List<SearchMatch> = withContext(Dispatchers.IO) {
         val query = rawQuery.trim()
         if (query.length < 2 || controller.pageCount <= 0) return@withContext emptyList()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-            val api35Matches = runCatching {
-                searchWithNativeApi35(controller, query, maxResults)
+        if (supportsNativeApi35) {
+            val api35Matches = runCatchingCancellable {
+                if (nativeApi35Runner != null) {
+                    nativeApi35Runner.invoke(controller, query, maxResults)
+                } else {
+                    searchWithNativeApi35(controller, query, maxResults)
+                }
             }.getOrNull()
             if (api35Matches != null) {
                 return@withContext api35Matches
             }
         }
 
-        searchWithPdfBox(context, controller, query, maxResults)
+        searchWithPdfBox(controller, query, maxResults)
     }
 
     @RequiresApi(Build.VERSION_CODES.VANILLA_ICE_CREAM)
     private suspend fun searchWithNativeApi35(
-        controller: PdfDocumentController,
+        controller: PdfDocumentAccess,
         query: String,
         maxResults: Int
     ): List<SearchMatch> {
@@ -643,8 +661,7 @@ object PdfSearchEngine {
     }
 
     private suspend fun searchWithPdfBox(
-        context: Context,
-        controller: PdfDocumentController,
+        controller: PdfDocumentAccess,
         query: String,
         maxResults: Int
     ): List<SearchMatch> {

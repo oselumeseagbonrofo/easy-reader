@@ -52,6 +52,14 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
+                LaunchedEffect(libraryViewModel, navController) {
+                    libraryViewModel.openBookEvents.collect { event ->
+                        navController.navigate("reader/${event.bookId}") {
+                            launchSingleTop = true
+                        }
+                    }
+                }
+
                 NavHost(
                     navController = navController,
                     startDestination = "library"

@@ -70,6 +70,7 @@ import com.ebookreader.app.data.parser.epub.EpubPageItem
 import com.ebookreader.app.data.parser.epub.EpubPaginator
 import com.ebookreader.app.data.parser.epub.EpubSelectionHelper
 import com.ebookreader.app.data.parser.epub.EpubTextKind
+import com.ebookreader.app.data.parser.epub.PaginatedEpub
 import com.ebookreader.app.domain.model.Bookmark
 import com.ebookreader.app.domain.model.HighlightColor
 import com.ebookreader.app.domain.model.ReaderSettings
@@ -118,8 +119,8 @@ fun EpubPagerView(
         activeSelection = null
     }
 
-    val pageBookmarksSet = remember(bookmarks) {
-        bookmarks.filter { !it.isTextSelection }.map { it.pageIndex }.toSet()
+    val pageBookmarksSet = remember(bookmarks, pages) {
+        resolveBookmarkedEpubPageIndices(bookmarks, pages)
     }
 
     HorizontalPager(
@@ -813,4 +814,16 @@ private fun buildDecoratedSliceText(
     }
 
     return builder.toAnnotatedString()
+}
+
+internal fun resolveBookmarkedEpubPageIndices(
+    bookmarks: List<Bookmark>,
+    pages: List<EpubPage>
+): Set<Int> {
+    if (pages.isEmpty()) return emptySet()
+    val paginated = PaginatedEpub(pages = pages, tocEntries = emptyList())
+    return bookmarks
+        .filter { !it.isTextSelection }
+        .map { paginated.resolvePageForBookmark(it) }
+        .toSet()
 }

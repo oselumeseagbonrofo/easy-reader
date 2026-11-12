@@ -20,7 +20,7 @@ interface BookDao {
     @Query("SELECT * FROM books WHERE fileUri = :uri LIMIT 1")
     suspend fun getBookByUri(uri: String): BookEntity?
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun upsertBook(book: BookEntity)
 
     @Query("""

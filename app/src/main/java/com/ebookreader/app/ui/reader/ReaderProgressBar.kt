@@ -136,7 +136,11 @@ fun InteractiveProgressScrubberHud(
     var pageInputText by remember { mutableStateOf("") }
 
     LaunchedEffect(visible) {
-        if (!visible) isEditingPage = false
+        if (!visible) {
+            val (nextDragging, nextEditing) = resetScrubberUiOnHide(isDragging, isEditingPage)
+            isDragging = nextDragging
+            isEditingPage = nextEditing
+        }
     }
 
     LaunchedEffect(currentPage, isDragging) {
@@ -153,7 +157,7 @@ fun InteractiveProgressScrubberHud(
 
     val previewProgress = ReadingProgressCalculator.computeProgress(previewPage, totalPages)
     val previewPercent = (previewProgress * 100f).roundToInt()
-    val previewTitle = remember(previewPage, totalPages) {
+    val previewTitle = remember(previewPage, totalPages, chapterTitleForPage) {
         chapterTitleForPage(previewPage)
     }
 
@@ -368,3 +372,8 @@ fun InteractiveProgressScrubberHud(
         }
     }
 }
+
+internal fun resetScrubberUiOnHide(
+    isDragging: Boolean,
+    isEditingPage: Boolean
+): Pair<Boolean, Boolean> = false to false

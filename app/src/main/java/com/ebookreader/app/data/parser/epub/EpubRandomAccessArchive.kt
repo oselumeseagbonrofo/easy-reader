@@ -31,6 +31,9 @@ class EpubRandomAccessArchive private constructor(
 
     private val channelLock = Any()
 
+    @Volatile
+    private var isClosed = false
+
     val entryPaths: Set<String>
         get() = entries.keys
 
@@ -51,27 +54,36 @@ class EpubRandomAccessArchive private constructor(
         if (record.compressedSize < 0 || record.uncompressedSize > maxBytes) return null
         if (record.uncompressedSize == 0 && record.compressedSize == 0) return ByteArray(0)
 
-        val rawCompressed: ByteArray
-        synchronized(channelLock) {
-            val localHeader = ByteBuffer.allocate(30).order(ByteOrder.LITTLE_ENDIAN)
-            if (!readFullyAt(record.localHeaderOffset, localHeader, 30)) return null
-            localHeader.flip()
-            if (localHeader.int != LOCAL_FILE_HEADER_SIG) return null
+        val rawCompressed = synchronized(channelLock) {
+            if (isClosed || !channel.isOpen) return null
+            try {
+                val localHeader = ByteBuffer.allocate(30).order(ByteOrder.LITTLE_ENDIAN)
+                if (!readFullyAt(record.localHeaderOffset, localHeader, 30)) {
+                    null
+                } else {
+                    localHeader.flip()
+                    if (localHeader.int != LOCAL_FILE_HEADER_SIG) {
+                        null
+                    } else {
+                        val fileNameLen = localHeader.getShort(26).toInt() and 0xFFFF
+                        val extraLen = localHeader.getShort(28).toInt() and 0xFFFF
+                        val dataOffset = record.localHeaderOffset + 30L + fileNameLen + extraLen
 
-            val fileNameLen = localHeader.getShort(26).toInt() and 0xFFFF
-            val extraLen = localHeader.getShort(28).toInt() and 0xFFFF
-            val dataOffset = record.localHeaderOffset + 30L + fileNameLen + extraLen
-
-            // Allocate +1 dummy trailing byte as required by java.util.zip.Inflater(nowrap = true)
-            val allocSize = if (record.compressionMethod == METHOD_DEFLATED) {
-                record.compressedSize + 1
-            } else {
-                record.compressedSize
+                        // Allocate +1 dummy trailing byte as required by java.util.zip.Inflater(nowrap = true)
+                        val allocSize = if (record.compressionMethod == METHOD_DEFLATED) {
+                            record.compressedSize + 1
+                        } else {
+                            record.compressedSize
+                        }
+                        val buf = ByteArray(allocSize)
+                        val dataBuf = ByteBuffer.wrap(buf, 0, record.compressedSize)
+                        if (readFullyAt(dataOffset, dataBuf, record.compressedSize)) buf else null
+                    }
+                }
+            } catch (_: java.io.IOException) {
+                null
             }
-            rawCompressed = ByteArray(allocSize)
-            val dataBuf = ByteBuffer.wrap(rawCompressed, 0, record.compressedSize)
-            if (!readFullyAt(dataOffset, dataBuf, record.compressedSize)) return null
-        }
+        } ?: return null
 
         return when (record.compressionMethod) {
             METHOD_STORED -> rawCompressed
@@ -119,8 +131,11 @@ class EpubRandomAccessArchive private constructor(
     }
 
     override fun close() {
-        if (closeChannelOnClose) {
-            runCatching { channel.close() }
+        isClosed = true
+        synchronized(channelLock) {
+            if (closeChannelOnClose) {
+                runCatching { channel.close() }
+            }
         }
     }
 

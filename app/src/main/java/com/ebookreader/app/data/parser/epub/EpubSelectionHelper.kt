@@ -24,22 +24,28 @@ object EpubSelectionHelper {
         val pos = charOffset.coerceIn(0, chapterText.lastIndex)
 
         var start = pos
+        var brokeAtTerminator = false
         while (start > 0) {
             val prev = chapterText[start - 1]
             if (prev == '\n') break
             if (prev in SENTENCE_TERMINATORS) {
-                // Break after sentence terminator followed by whitespace/quote
-                if (chapterText[start].isWhitespace() || prev == '!' || prev == '?') {
+                var probe = start
+                while (probe < chapterText.length && chapterText[probe] in TRAILING_QUOTES_OR_PARENS) {
+                    probe++
+                }
+                if (probe >= chapterText.length || chapterText[probe].isWhitespace() || prev == '!' || prev == '?') {
+                    brokeAtTerminator = true
                     break
                 }
             }
             start--
         }
-        while (start < chapterText.length &&
-            (chapterText[start].isWhitespace() || chapterText[start] in setOf('“', '"'))
-                && start < pos
-        ) {
-            if (!chapterText[start].isWhitespace()) break
+        if (brokeAtTerminator) {
+            while (start < pos && chapterText[start] in TRAILING_QUOTES_OR_PARENS) {
+                start++
+            }
+        }
+        while (start < pos && chapterText[start].isWhitespace()) {
             start++
         }
 
